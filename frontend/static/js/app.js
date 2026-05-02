@@ -101,7 +101,7 @@ async function loadSummary() {
 }
 
 // ---- Page switching ----
-function showPage(name) {
+function showPage(name, event) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.page-tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');

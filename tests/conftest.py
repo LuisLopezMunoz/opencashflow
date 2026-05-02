@@ -1,18 +1,20 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from backend.database import Base, get_db
 from backend.main import app
 
-TEST_DB_URL = "sqlite:///./test_opencashflow.db"
+TEST_DB_URL = "sqlite:///:memory:"
 engine = create_engine(TEST_DB_URL, connect_args={"check_same_thread": False})
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Share a single in-memory connection across all sessions so the DB persists
+_connection = engine.connect()
 
 
 def override_get_db():
-    db = TestingSessionLocal()
+    db = sessionmaker(autocommit=False, autoflush=False, bind=_connection)()
     try:
         yield db
     finally:
@@ -21,11 +23,11 @@ def override_get_db():
 
 @pytest.fixture(scope="module")
 def client():
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=_connection)
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as c:
         yield c
-    Base.metadata.drop_all(bind=engine)
+    Base.metadata.drop_all(bind=_connection)
     app.dependency_overrides.clear()
 
 

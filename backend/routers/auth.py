@@ -58,7 +58,6 @@ def update_me(
             raise HTTPException(status_code=400, detail="Email already in use")
         current_user.email = user_update.email
     if user_update.password is not None:
-        from backend.auth import get_password_hash
         current_user.hashed_password = get_password_hash(user_update.password)
     db.commit()
     db.refresh(current_user)
