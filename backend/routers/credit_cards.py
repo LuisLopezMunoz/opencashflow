@@ -1,7 +1,7 @@
 from datetime import date
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
@@ -14,7 +14,9 @@ from backend.schemas.credit_card import (
     CreditCardChargeUpdate,
     CreditCardCreate,
     CreditCardOut,
+    CreditCardProjectionOut,
     CreditCardUpdate,
+    PaymentProjectionMonth,
 )
 
 router = APIRouter(prefix="/api/credit-cards", tags=["credit-cards"])
@@ -179,3 +181,80 @@ def delete_charge(
     card.current_balance -= charge.amount
     db.delete(charge)
     db.commit()
+
+
+# --- Payment projection ---
+
+def _add_months(d: date, n: int) -> date:
+    """Return a date n months after d."""
+    import calendar
+    month = d.month - 1 + n
+    year = d.year + month // 12
+    month = month % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return d.replace(year=year, month=month, day=day)
+
+
+@router.get("/{card_id}/projection", response_model=CreditCardProjectionOut)
+def get_payment_projection(
+    card_id: int,
+    months: int = Query(default=12, ge=1, le=60),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Project month-by-month balance, interest, and minimum payment for a credit card."""
+    card = db.query(CreditCard).filter(
+        CreditCard.id == card_id, CreditCard.user_id == current_user.id
+    ).first()
+    if not card:
+        raise HTTPException(status_code=404, detail="Credit card not found")
+
+    monthly_rate = card.interest_rate / 12
+    balance = card.current_balance
+    today = date.today()
+    projection: List[PaymentProjectionMonth] = []
+
+    for i in range(months):
+        month_start = _add_months(today.replace(day=1), i)
+        month_label = month_start.strftime("%Y-%m")
+        opening = round(balance, 2)
+
+        # Charges due this month from active installment charges
+        charges_due = 0.0
+        active_charges = (
+            db.query(CreditCardCharge)
+            .filter(
+                CreditCardCharge.credit_card_id == card_id,
+                CreditCardCharge.installments > 1,
+                CreditCardCharge.installments_paid < CreditCardCharge.installments,
+            )
+            .all()
+        )
+        for ch in active_charges:
+            remaining = ch.installments - ch.installments_paid
+            if remaining > 0:
+                charges_due += ch.amount / ch.installments
+
+        interest = round(balance * monthly_rate, 2)
+        minimum = round(balance * card.minimum_payment_rate, 2) if balance > 0 else 0.0
+        # Closing balance: add interest, subtract minimum payment
+        balance = max(0.0, round(balance + interest - minimum, 2))
+
+        projection.append(
+            PaymentProjectionMonth(
+                month=month_label,
+                opening_balance=opening,
+                charges_due=round(charges_due, 2),
+                interest=interest,
+                minimum_payment=minimum,
+                closing_balance=balance,
+            )
+        )
+
+    return CreditCardProjectionOut(
+        card_id=card.id,
+        card_name=card.name,
+        current_balance=round(card.current_balance, 2),
+        interest_rate=card.interest_rate,
+        months=projection,
+    )

@@ -11,6 +11,9 @@ class TransactionCreate(BaseModel):
     category: Optional[str] = None
     description: Optional[str] = None
     transaction_date: Optional[date] = None
+    recurrence: str = "unique"  # unique / sporadic / periodic
+    period_type: Optional[str] = None  # daily / weekly / monthly / yearly
+    next_occurrence: Optional[date] = None
 
 
 class TransactionUpdate(BaseModel):
@@ -19,6 +22,9 @@ class TransactionUpdate(BaseModel):
     category: Optional[str] = None
     description: Optional[str] = None
     transaction_date: Optional[date] = None
+    recurrence: Optional[str] = None
+    period_type: Optional[str] = None
+    next_occurrence: Optional[date] = None
 
 
 class TransactionOut(BaseModel):
@@ -29,6 +35,9 @@ class TransactionOut(BaseModel):
     category: Optional[str]
     description: Optional[str]
     transaction_date: date
+    recurrence: str
+    period_type: Optional[str]
+    next_occurrence: Optional[date]
     created_at: datetime
 
     model_config = {"from_attributes": True}
