@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  opencashflow:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OCF_SECRET_KEY=${OCF_SECRET_KEY:-change-this-in-production}
+      - DATABASE_URL=sqlite:////app/data/opencashflow.db
+    restart: unless-stopped
