@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenCashFlow</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <nav class="navbar">
+    <div class="brand">💰 OpenCashFlow</div>
+    <div class="nav-links" id="nav-links">
+      <span id="nav-user" class="nav-user"></span>
+      <button class="btn btn-outline" id="btn-logout" onclick="logout()" style="display:none">Logout</button>
+    </div>
+  </nav>
+
+  <!-- Auth Section -->
+  <section id="auth-section" class="auth-section">
+    <div class="auth-card">
+      <div class="tab-bar">
+        <button class="tab active" id="tab-login" onclick="showTab('login')">Login</button>
+        <button class="tab" id="tab-register" onclick="showTab('register')">Register</button>
+      </div>
+
+      <!-- Login Form -->
+      <form id="login-form" onsubmit="login(event)">
+        <h2>Welcome back</h2>
+        <label>Username</label>
+        <input type="text" id="login-username" placeholder="Username" required />
+        <label>Password</label>
+        <input type="password" id="login-password" placeholder="Password" required />
+        <button type="submit" class="btn btn-primary">Login</button>
+        <p class="error" id="login-error"></p>
+      </form>
+
+      <!-- Register Form -->
+      <form id="register-form" onsubmit="register(event)" style="display:none">
+        <h2>Create account</h2>
+        <label>Username</label>
+        <input type="text" id="reg-username" placeholder="Username" required />
+        <label>Email</label>
+        <input type="email" id="reg-email" placeholder="Email" required />
+        <label>Password</label>
+        <input type="password" id="reg-password" placeholder="Password" required />
+        <button type="submit" class="btn btn-primary">Register</button>
+        <p class="error" id="reg-error"></p>
+      </form>
+    </div>
+  </section>
+
+  <!-- App Section -->
+  <section id="app-section" style="display:none">
+    <!-- Summary Banner -->
+    <div class="summary-banner" id="summary-banner"></div>
+
+    <!-- Tabs -->
+    <div class="page-tabs">
+      <button class="page-tab active" onclick="showPage('wallets')">Wallets</button>
+      <button class="page-tab" onclick="showPage('transactions')">Transactions</button>
+      <button class="page-tab" onclick="showPage('credit-cards')">Credit Cards</button>
+      <button class="page-tab" onclick="showPage('loans')">Loans</button>
+      <button class="page-tab" onclick="showPage('income')">Income Sources</button>
+    </div>
+
+    <!-- Wallets Page -->
+    <div id="page-wallets" class="page active">
+      <div class="page-header">
+        <h2>Wallets / Diaries</h2>
+        <button class="btn btn-primary" onclick="openModal('wallet-modal')">+ Add Wallet</button>
+      </div>
+      <div id="wallets-list" class="cards-grid"></div>
+    </div>
+
+    <!-- Transactions Page -->
+    <div id="page-transactions" class="page">
+      <div class="page-header">
+        <h2>Transactions</h2>
+        <button class="btn btn-primary" onclick="openModal('tx-modal')">+ Add Transaction</button>
+      </div>
+      <div class="filter-bar">
+        <select id="tx-filter-type" onchange="loadTransactions()">
+          <option value="">All types</option>
+          <option value="income">Income</option>
+          <option value="expense">Expense</option>
+          <option value="transfer">Transfer</option>
+        </select>
+      </div>
+      <div id="transactions-table-wrapper">
+        <table class="data-table">
+          <thead><tr><th>Date</th><th>Wallet</th><th>Type</th><th>Category</th><th>Description</th><th>Amount</th><th></th></tr></thead>
+          <tbody id="transactions-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Credit Cards Page -->
+    <div id="page-credit-cards" class="page">
+      <div class="page-header">
+        <h2>Credit Cards</h2>
+        <button class="btn btn-primary" onclick="openModal('cc-modal')">+ Add Card</button>
+      </div>
+      <div id="cc-list" class="cards-grid"></div>
+    </div>
+
+    <!-- Loans Page -->
+    <div id="page-loans" class="page">
+      <div class="page-header">
+        <h2>Bank Loans</h2>
+        <button class="btn btn-primary" onclick="openModal('loan-modal')">+ Add Loan</button>
+      </div>
+      <div id="loans-list" class="cards-grid"></div>
+    </div>
+
+    <!-- Income Sources Page -->
+    <div id="page-income" class="page">
+      <div class="page-header">
+        <h2>Income Sources</h2>
+        <button class="btn btn-primary" onclick="openModal('income-modal')">+ Add Source</button>
+      </div>
+      <div id="income-list" class="cards-grid"></div>
+    </div>
+  </section>
+
+  <!-- Modals -->
+  <!-- Wallet Modal -->
+  <div class="modal-overlay" id="wallet-modal">
+    <div class="modal">
+      <h3>Wallet</h3>
+      <form onsubmit="saveWallet(event)">
+        <input type="hidden" id="wallet-id" />
+        <label>Name</label><input type="text" id="wallet-name" required />
+        <label>Type</label>
+        <select id="wallet-type">
+          <option>cash</option><option>bank</option><option>savings</option><option>investment</option><option>other</option>
+        </select>
+        <label>Currency</label><input type="text" id="wallet-currency" value="USD" maxlength="10" required />
+        <label>Initial Balance</label><input type="number" id="wallet-balance" value="0" step="0.01" required />
+        <label>Description</label><input type="text" id="wallet-desc" />
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn btn-outline" onclick="closeModal('wallet-modal')">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Transaction Modal -->
+  <div class="modal-overlay" id="tx-modal">
+    <div class="modal">
+      <h3>Transaction</h3>
+      <form onsubmit="saveTransaction(event)">
+        <label>Wallet</label>
+        <select id="tx-wallet-id" required></select>
+        <label>Type</label>
+        <select id="tx-type">
+          <option value="income">Income</option>
+          <option value="expense">Expense</option>
+          <option value="transfer">Transfer</option>
+        </select>
+        <label>Amount</label><input type="number" id="tx-amount" step="0.01" required />
+        <label>Category</label><input type="text" id="tx-category" />
+        <label>Description</label><input type="text" id="tx-desc" />
+        <label>Date</label><input type="date" id="tx-date" required />
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn btn-outline" onclick="closeModal('tx-modal')">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Credit Card Modal -->
+  <div class="modal-overlay" id="cc-modal">
+    <div class="modal">
+      <h3>Credit Card</h3>
+      <form onsubmit="saveCreditCard(event)">
+        <input type="hidden" id="cc-id" />
+        <label>Name</label><input type="text" id="cc-name" required />
+        <label>Bank</label><input type="text" id="cc-bank" />
+        <label>Credit Limit</label><input type="number" id="cc-limit" step="0.01" required />
+        <label>Current Balance</label><input type="number" id="cc-balance" value="0" step="0.01" required />
+        <label>Currency</label><input type="text" id="cc-currency" value="USD" maxlength="10" required />
+        <label>Closing Day (1-31)</label><input type="number" id="cc-closing" min="1" max="31" />
+        <label>Due Day (1-31)</label><input type="number" id="cc-due" min="1" max="31" />
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn btn-outline" onclick="closeModal('cc-modal')">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Loan Modal -->
+  <div class="modal-overlay" id="loan-modal">
+    <div class="modal">
+      <h3>Bank Loan</h3>
+      <form onsubmit="saveLoan(event)">
+        <input type="hidden" id="loan-id" />
+        <label>Name</label><input type="text" id="loan-name" required />
+        <label>Bank</label><input type="text" id="loan-bank" />
+        <label>Principal Amount</label><input type="number" id="loan-principal" step="0.01" required />
+        <label>Remaining Balance</label><input type="number" id="loan-remaining" step="0.01" required />
+        <label>Interest Rate (%)</label><input type="number" id="loan-rate" value="0" step="0.01" required />
+        <label>Monthly Payment</label><input type="number" id="loan-monthly" value="0" step="0.01" required />
+        <label>Currency</label><input type="text" id="loan-currency" value="USD" maxlength="10" required />
+        <label>Start Date</label><input type="date" id="loan-start" />
+        <label>End Date</label><input type="date" id="loan-end" />
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn btn-outline" onclick="closeModal('loan-modal')">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Income Source Modal -->
+  <div class="modal-overlay" id="income-modal">
+    <div class="modal">
+      <h3>Income Source</h3>
+      <form onsubmit="saveIncomeSource(event)">
+        <input type="hidden" id="income-id" />
+        <label>Name</label><input type="text" id="income-name" required />
+        <label>Type</label>
+        <select id="income-type">
+          <option value="salary">Salary</option>
+          <option value="freelance">Freelance</option>
+          <option value="rental">Rental</option>
+          <option value="investment">Investment</option>
+          <option value="other">Other</option>
+        </select>
+        <label>Amount</label><input type="number" id="income-amount" step="0.01" required />
+        <label>Frequency</label>
+        <select id="income-frequency">
+          <option value="weekly">Weekly</option>
+          <option value="biweekly">Biweekly</option>
+          <option value="monthly">Monthly</option>
+          <option value="yearly">Yearly</option>
+        </select>
+        <label>Currency</label><input type="text" id="income-currency" value="USD" maxlength="10" required />
+        <label>Description</label><input type="text" id="income-desc" />
+        <label><input type="checkbox" id="income-active" checked /> Active</label>
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn btn-outline" onclick="closeModal('income-modal')">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
