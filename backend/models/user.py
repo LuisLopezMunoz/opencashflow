@@ -19,3 +19,5 @@ class User(Base):
     credit_cards = relationship("CreditCard", back_populates="owner", cascade="all, delete-orphan")
     loans = relationship("BankLoan", back_populates="owner", cascade="all, delete-orphan")
     income_sources = relationship("IncomeSource", back_populates="owner", cascade="all, delete-orphan")
+    wishlists = relationship("WishList", back_populates="owner", cascade="all, delete-orphan")
+    budgets = relationship("Budget", back_populates="owner", cascade="all, delete-orphan")

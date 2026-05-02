@@ -12,6 +12,8 @@ class CreditCardCreate(BaseModel):
     currency: str = "USD"
     closing_day: Optional[int] = None
     due_day: Optional[int] = None
+    interest_rate: float = 0.0
+    minimum_payment_rate: float = 0.05
 
 
 class CreditCardUpdate(BaseModel):
@@ -22,6 +24,8 @@ class CreditCardUpdate(BaseModel):
     currency: Optional[str] = None
     closing_day: Optional[int] = None
     due_day: Optional[int] = None
+    interest_rate: Optional[float] = None
+    minimum_payment_rate: Optional[float] = None
 
 
 class CreditCardOut(BaseModel):
@@ -34,6 +38,8 @@ class CreditCardOut(BaseModel):
     currency: str
     closing_day: Optional[int]
     due_day: Optional[int]
+    interest_rate: float
+    minimum_payment_rate: float
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -44,6 +50,8 @@ class CreditCardChargeCreate(BaseModel):
     description: Optional[str] = None
     category: Optional[str] = None
     charge_date: Optional[date] = None
+    installments: int = 1
+    installments_paid: int = 0
 
 
 class CreditCardChargeUpdate(BaseModel):
@@ -51,6 +59,8 @@ class CreditCardChargeUpdate(BaseModel):
     description: Optional[str] = None
     category: Optional[str] = None
     charge_date: Optional[date] = None
+    installments: Optional[int] = None
+    installments_paid: Optional[int] = None
 
 
 class CreditCardChargeOut(BaseModel):
@@ -60,6 +70,25 @@ class CreditCardChargeOut(BaseModel):
     description: Optional[str]
     category: Optional[str]
     charge_date: date
+    installments: int
+    installments_paid: int
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class PaymentProjectionMonth(BaseModel):
+    month: str  # YYYY-MM
+    opening_balance: float
+    charges_due: float
+    interest: float
+    minimum_payment: float
+    closing_balance: float
+
+
+class CreditCardProjectionOut(BaseModel):
+    card_id: int
+    card_name: str
+    current_balance: float
+    interest_rate: float
+    months: List[PaymentProjectionMonth]
