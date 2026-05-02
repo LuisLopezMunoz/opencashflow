@@ -16,6 +16,11 @@ class Transaction(Base):
     category = Column(String(100), nullable=True)
     description = Column(String(255), nullable=True)
     transaction_date = Column(Date, nullable=False, default=date.today)
+    # Recurrence: unique / sporadic / periodic
+    recurrence = Column(String(20), nullable=False, default="unique")
+    # Period type used when recurrence is periodic: daily / weekly / monthly / yearly
+    period_type = Column(String(20), nullable=True)
+    next_occurrence = Column(Date, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     wallet = relationship("Wallet", back_populates="transactions")

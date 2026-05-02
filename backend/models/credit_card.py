@@ -18,6 +18,10 @@ class CreditCard(Base):
     currency = Column(String(10), nullable=False, default="USD")
     closing_day = Column(Integer, nullable=True)  # day of month when statement closes
     due_day = Column(Integer, nullable=True)      # day of month payment is due
+    # Annual interest rate (e.g. 0.24 for 24 %) agreed with the bank (tasa pactada)
+    interest_rate = Column(Float, nullable=False, default=0.0)
+    # Minimum payment as a fraction of the current balance (e.g. 0.05 for 5 %)
+    minimum_payment_rate = Column(Float, nullable=False, default=0.05)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     owner = relationship("User", back_populates="credit_cards")
@@ -35,6 +39,10 @@ class CreditCardCharge(Base):
     description = Column(String(255), nullable=True)
     category = Column(String(100), nullable=True)
     charge_date = Column(Date, nullable=False, default=date.today)
+    # Installments (cuotas): total number of installments (1 = single charge)
+    installments = Column(Integer, nullable=False, default=1)
+    # Number of installments already paid
+    installments_paid = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     credit_card = relationship("CreditCard", back_populates="charges")

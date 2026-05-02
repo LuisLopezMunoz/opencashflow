@@ -7,7 +7,8 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.database import Base, engine
 from backend.models import credit_card, income_source, loan, transaction, user, wallet  # noqa: F401
-from backend.routers import auth, credit_cards, income_sources, loans, summary, transactions, wallets
+from backend.models import budget, wishlist  # noqa: F401
+from backend.routers import auth, budgets, cash_flow, credit_cards, income_sources, loans, summary, transactions, wallets, wishlists
 
 # Create all tables
 Base.metadata.create_all(bind=engine)
@@ -33,6 +34,9 @@ app.include_router(transactions.router)
 app.include_router(credit_cards.router)
 app.include_router(loans.router)
 app.include_router(income_sources.router)
+app.include_router(wishlists.router)
+app.include_router(budgets.router)
+app.include_router(cash_flow.router)
 app.include_router(summary.router)
 
 # Serve frontend static files
