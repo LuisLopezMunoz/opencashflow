@@ -21,3 +21,4 @@ class User(Base):
     income_sources = relationship("IncomeSource", back_populates="owner", cascade="all, delete-orphan")
     wishlists = relationship("WishList", back_populates="owner", cascade="all, delete-orphan")
     budgets = relationship("Budget", back_populates="owner", cascade="all, delete-orphan")
+    cashflow_sheets = relationship("CashflowSheet", back_populates="owner", cascade="all, delete-orphan")
