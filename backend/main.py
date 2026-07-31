@@ -5,10 +5,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.cashflow import models as cashflow_models  # noqa: F401
 from backend.database import Base, engine
 from backend.models import credit_card, income_source, loan, transaction, user, wallet  # noqa: F401
 from backend.models import budget, wishlist  # noqa: F401
 from backend.routers import auth, budgets, cash_flow, credit_cards, income_sources, loans, summary, transactions, wallets, wishlists
+from backend.routers import cashflow_sheets
 
 # Create all tables
 Base.metadata.create_all(bind=engine)
@@ -38,6 +40,7 @@ app.include_router(wishlists.router)
 app.include_router(budgets.router)
 app.include_router(cash_flow.router)
 app.include_router(summary.router)
+app.include_router(cashflow_sheets.router)
 
 # Serve frontend static files
 _frontend_dir = Path(__file__).parent.parent / "frontend"
