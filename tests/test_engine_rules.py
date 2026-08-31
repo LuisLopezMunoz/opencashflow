@@ -590,6 +590,33 @@ def test_carry_forward_base_rule_sum_rows_dependency_is_detected(db):
     assert total_cells[0].error is None
 
 
+def test_carry_forward_cycle_through_base_rule_is_detected(db):
+    """A carry_forward wrapping sum_rows must participate in cycle detection
+    exactly like a bare sum_rows would -- the cross-period carry itself never
+    creates a cycle, but its base_rule's same-period deps still can."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    a = SheetRow(section_id=section.id, name="A", sort_order=0)
+    b = SheetRow(section_id=section.id, name="B", sort_order=1)
+    c = SheetRow(section_id=section.id, name="C", sort_order=2,
+                 default_projection_rule={"type": "constant", "value": 10})
+    db.add_all([a, b, c])
+    db.flush()
+    a.default_projection_rule = {"type": "carry_forward", "base_rule": {"type": "sum_rows", "row_ids": [b.id, c.id]}}
+    b.default_projection_rule = {"type": "percent_of_row", "row_id": a.id, "percent": 10}
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    for row_id in (a.id, b.id):
+        for cell in _cells_for(matrix, row_id):
+            assert cell.error == "cycle_detected"
+            assert cell.projected_value is None
+    for cell in _cells_for(matrix, c.id):
+        assert cell.error is None
+        assert cell.projected_value == Decimal("10")
+
+
 def test_carry_forward_nested_is_rejected_as_unsupported(db):
     sheet = _make_sheet(db, TEST_USER_ID, months=1)
     section = _make_section(db, sheet)
