@@ -5,8 +5,12 @@ priority order per cell:
 
   1. Active CellOverride with override_type = 'manual_value'  → use override.value
   2. Active CellOverride with override_type = 'manual_rule'   → evaluate custom_rule
-  3. SheetRow.default_projection_rule                         → evaluate row rule
-  4. No rule                                                  → None (empty)
+  3. Active CellOverride with override_type = 'lock'          → use override.value
+                          (frozen at whatever was captured when the lock was
+                          created — the engine only reads it, never captures
+                          it; see the consuming app's override write path)
+  4. SheetRow.default_projection_rule                         → evaluate row rule
+  5. No rule                                                  → None (empty)
 
 Supported rules in V1:
   - constant          { "type": "constant", "value": <number> }
@@ -187,7 +191,6 @@ def _evaluate_rule(
     rule: Dict,
     row_id: int,
     period_id: int,
-    period_sort_order: int,
     sorted_period_ids: List[int],  # all period ids in sort order
     computed: Dict[Tuple[int, int], Optional[Decimal]],  # (row_id, period_id) → value
     row_signs: Dict[int, int],  # row_id → +1 (positive) / -1 (negative)
@@ -211,9 +214,13 @@ def _evaluate_rule(
         return Decimal(str(raw)), EffectiveSource.RULE, None
 
     if rule_type == "previous_period":
-        if period_sort_order == 0:
-            # First period — no previous exists
-            return None, EffectiveSource.EMPTY, None
+        # No "period_sort_order == 0 means first period" shortcut here on
+        # purpose: sort_order 0 is only the first period for a sheet with no
+        # backfilled history. Once historical periods exist (negative
+        # sort_order, see periods.extend_periods_backward), a period at
+        # sort_order 0 legitimately has a previous period to read. Index
+        # position in sorted_period_ids is the only thing that actually
+        # tells us whether a previous period exists.
         prev_index = sorted_period_ids.index(period_id) - 1
         if prev_index < 0:
             return None, EffectiveSource.EMPTY, None
@@ -301,7 +308,6 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
         .all()
     )
     sorted_period_ids = [p.id for p in periods]
-    period_sort_orders = {p.id: p.sort_order for p in periods}
 
     # Load sections with rows (ordered)
     sections: List[SheetSection] = (
@@ -360,6 +366,15 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
                         continue
                     if active_ov.override_type == "manual_rule":
                         effective_rules[key] = active_ov.custom_rule
+                        continue
+                    if active_ov.override_type == "lock":
+                        # Frozen at whatever value was captured when the lock
+                        # was created (see the consuming app's override
+                        # write path) — from here on it behaves exactly like
+                        # a manual_value override. The engine doesn't capture
+                        # anything itself; it only respects what's stored.
+                        effective_manual[key] = active_ov.value
+                        effective_rules[key] = None
                         continue
             # Fall back to row default rule
             effective_rules[key] = row.default_projection_rule
@@ -442,7 +457,6 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
                         rule=rule,
                         row_id=row_id,
                         period_id=period.id,
-                        period_sort_order=period_sort_orders[period.id],
                         sorted_period_ids=sorted_period_ids,
                         computed=computed,
                         row_signs=row_signs,

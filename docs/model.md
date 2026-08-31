@@ -10,7 +10,7 @@ Este documento define los términos canónicos del dominio. Cualquier nombre de 
 La planilla raíz. Pertenece a un `user_id` (un entero simple: este paquete no modela usuarios ni autenticación — ver "Ownership" más abajo) y define el horizonte temporal (número de meses) y la moneda base. Una planilla **nunca** mezcla monedas; si se necesitan múltiples monedas, se usan planillas separadas.
 
 ### SheetPeriod
-Cada **columna** de la planilla. Representa un mes calendario (día siempre = 1 del mes). Los períodos se generan automáticamente al crear la planilla (`opencashflow.periods.generate_periods`) según `base_period` + `horizon_months`, pero también pueden crearse manualmente para períodos históricos.
+Cada **columna** de la planilla. Representa un mes calendario (día siempre = 1 del mes). Los períodos se generan automáticamente al crear la planilla (`opencashflow.periods.generate_periods`) según `base_period` + `horizon_months`. También se puede extender una planilla ya creada con períodos históricos ANTERIORES al primero existente, vía `opencashflow.periods.extend_periods_backward(sheet, months, db)` — componible (llamarla varias veces da historia contigua), idempotente por fecha, y marca los períodos creados con `is_closed=True`. `opencashflow.periods.find_anchor_period(periods, today=None)` resuelve cuál período tratar como "ahora" para vistas relativas (equivalente al período que matchea el mes actual, o el futuro más cercano, o el más reciente si toda la planilla quedó en el pasado).
 
 - **Período futuro**: `period_date > hoy`. Muestra únicamente el valor proyectado.
 - **Período actual**: `period_date` cae en el mes en curso. Muestra proyectado y real en paralelo.
@@ -114,9 +114,19 @@ Registro inmutable creado cuando el usuario escribe un valor manual o asigna una
 |---|---|
 | `manual_value` | El usuario ingresó un número directamente. |
 | `manual_rule` | El usuario reemplazó la regla de la fila solo para esta celda. |
-| `lock` | El usuario bloqueó el valor calculado para que no cambie aunque cambie la regla. |
+| `lock` | El valor calculado se congela para que no cambie aunque cambie la regla. El motor solo respeta el `value` ya guardado en el override (lo trata igual que `manual_value`) — **capturar** ese valor (correr `compute_sheet()` y guardar lo que haya dado en ese momento) es responsabilidad de la app consumidora al crear el override, no algo que este paquete haga por sí solo. |
 
 Solo el override con `superseded_at = NULL` está vigente.
+
+### CellActualEntry
+Log de solo-inserción (append-only) de cada escritura a la capa real de una celda
+(`actual_value`/`accrued_value`/`paid_value`). A diferencia de `CellOverride`, el motor
+**nunca** necesita resolver "cuál es el vigente" — `SheetCell.actual_value`/`accrued_value`/`paid_value`
+son siempre la única fuente que `compute_sheet()` lee. Esta tabla existe solo para que una
+corrección a un valor real ya registrado no borre el rastro de cuál era antes: cada escritura
+inserta una fila nueva con el estado completo resultante de los tres campos (una foto, no un
+delta), nunca se actualiza una fila existente. `created_by` sigue el mismo criterio que el
+resto del paquete: entero simple, sin `ForeignKey`.
 
 ### CellDependency
 Arista en el grafo de dependencias entre filas. Permite ordenar topológicamente el recálculo y detectar ciclos antes de evaluar.
@@ -157,10 +167,13 @@ La planilla proyecta y explica; el valor real (poblado por la app consumidora) r
 2. ¿Hay CellOverride vigente con override_type = manual_rule?
        → evalúa override.custom_rule. STOP.
 
-3. ¿La fila tiene default_projection_rule?
+3. ¿Hay CellOverride vigente con override_type = lock?
+       → usa override.value (congelado). STOP.
+
+4. ¿La fila tiene default_projection_rule?
        → evalúa esa regla.
 
-4. Sin regla aplicable
+5. Sin regla aplicable
        → effective_value = NULL (vacío).
 ```
 

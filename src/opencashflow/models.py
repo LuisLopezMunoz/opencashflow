@@ -154,6 +154,9 @@ class SheetCell(Base):
     overrides = relationship(
         "CellOverride", back_populates="cell", cascade="all, delete-orphan", order_by="CellOverride.created_at"
     )
+    actual_entries = relationship(
+        "CellActualEntry", back_populates="cell", cascade="all, delete-orphan", order_by="CellActualEntry.created_at"
+    )
     computed_results = relationship(
         "ComputedResult", back_populates="cell", cascade="all, delete-orphan"
     )
@@ -183,6 +186,34 @@ class CellOverride(Base):
     superseded_at = Column(DateTime, nullable=True)
 
     cell = relationship("SheetCell", back_populates="overrides")
+
+
+class CellActualEntry(Base):
+    """Append-only audit log of writes to SheetCell's real layer
+    (actual_value/accrued_value/paid_value).
+
+    Unlike CellOverride, this is NOT something the engine resolves between
+    competing sources — SheetCell.actual_value/accrued_value/paid_value are
+    always the single source of truth the engine reads (see
+    engine._real_fields). This table exists purely so a correction to a
+    previously-recorded real value doesn't erase the trail of what it used
+    to be. Every write inserts a new row with the FULL resulting state of
+    the three fields (a snapshot, not a delta) — never updated.
+    """
+
+    __tablename__ = "cell_actual_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cell_id = Column(Integer, ForeignKey("sheet_cells.id"), nullable=False, index=True)
+    actual_value = Column(Numeric(14, 2), nullable=True)
+    accrued_value = Column(Numeric(14, 2), nullable=True)
+    paid_value = Column(Numeric(14, 2), nullable=True)
+    note = Column(String(255), nullable=True)
+    # Plain user id, not a ForeignKey — see CashflowSheet.user_id.
+    created_by = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    cell = relationship("SheetCell", back_populates="actual_entries")
 
 
 class CellDependency(Base):

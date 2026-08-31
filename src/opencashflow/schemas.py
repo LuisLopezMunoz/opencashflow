@@ -189,6 +189,51 @@ class CellOverrideOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# SheetCell real-layer input (actual_value/accrued_value/paid_value)
+# ---------------------------------------------------------------------------
+
+class CellActualUpdate(BaseModel):
+    """Request body for PATCH /sheets/{id}/cells/{row_id}/{period_id}/actual.
+
+    All three fields are independent — none is inferred from another. Only
+    fields actually present in the request are applied (use
+    `model_fields_set` to tell "omitted" apart from "explicitly null", so a
+    caller can clear a single field without touching the other two).
+    """
+
+    actual_value: Optional[Decimal] = None
+    accrued_value: Optional[Decimal] = None
+    paid_value: Optional[Decimal] = None
+    note: Optional[str] = None
+
+
+class CellActualOut(BaseModel):
+    row_id: int
+    period_id: int
+    actual_value: Optional[Decimal]
+    accrued_value: Optional[Decimal]
+    paid_value: Optional[Decimal]
+    # Derived here (accrued - paid) as a convenience; not persisted on the
+    # cell — same convention as the engine's own in-memory-only derivation.
+    pending_value: Optional[Decimal]
+    updated_by: int
+    updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Backfilling historical periods
+# ---------------------------------------------------------------------------
+
+class PeriodsBackfillCreate(BaseModel):
+    months: int  # how many months of history to add before the earliest existing period
+
+
+class PeriodsBackfillOut(BaseModel):
+    created: List[PeriodOutSimple]
+    skipped_existing: int
+
+
+# ---------------------------------------------------------------------------
 # Computed cell result (returned in memory by the engine)
 # ---------------------------------------------------------------------------
 

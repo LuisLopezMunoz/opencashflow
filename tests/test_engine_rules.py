@@ -387,3 +387,101 @@ def test_actual_value_absent_leaves_variance_none(db):
     assert result.actual_value is None
     assert result.variance is None
     assert result.pending_value is None
+
+
+# ---------------------------------------------------------------------------
+# 8: previous_period must not special-case sort_order == 0 as "no history
+#    exists" — once historical periods have been backfilled (negative
+#    sort_order), a period AT sort_order 0 legitimately has a previous
+#    period to read. Regression test for the bug found while designing
+#    extend_periods_backward.
+# ---------------------------------------------------------------------------
+
+def test_previous_period_reads_across_the_sort_order_zero_boundary(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=2)  # sort_order 0, 1
+    section = _make_section(db, sheet)
+
+    # A historical period before the sheet's own base_period, sort_order -1
+    # — the shape extend_periods_backward produces.
+    historical = SheetPeriod(sheet_id=sheet.id, period_date=datetime(2025, 12, 1),
+                              label="Dec 2025", is_closed=True, sort_order=-1)
+    db.add(historical)
+    db.flush()
+
+    row = SheetRow(section_id=section.id, name="Saldo", sort_order=0,
+                    default_projection_rule={"type": "previous_period"})
+    db.add(row)
+    db.commit()
+
+    # Seed the historical period's value via an override (the only way an
+    # engine-level test can put a value on a cell directly).
+    cell = SheetCell(row_id=row.id, period_id=historical.id)
+    db.add(cell)
+    db.flush()
+    db.add(CellOverride(cell_id=cell.id, value=Decimal("500"), override_type="manual_value",
+                         created_by=TEST_USER_ID))
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)  # [historical(-1), sort=0, sort=1]
+
+    assert cells[0].projected_value == Decimal("500")
+    # Before the fix, this was unconditionally None because sort_order == 0
+    # short-circuited before ever looking at prev_index.
+    assert cells[1].projected_value == Decimal("500")
+    assert cells[1].error is None
+    assert cells[2].projected_value == Decimal("500")
+
+
+# ---------------------------------------------------------------------------
+# 9: lock overrides now freeze the cell at whatever value was captured when
+#    the lock was created (capturing it is the consuming app's job — the
+#    engine only ever respects what's already stored).
+# ---------------------------------------------------------------------------
+
+def test_lock_override_freezes_the_value_like_manual_value(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Bloqueada", sort_order=0,
+                    default_projection_rule={"type": "constant", "value": 100})
+    db.add(row)
+    db.commit()
+    period = _get_periods(db, sheet.id)[0]
+
+    cell = SheetCell(row_id=row.id, period_id=period.id)
+    db.add(cell)
+    db.flush()
+    db.add(CellOverride(cell_id=cell.id, value=Decimal("999"), override_type="lock",
+                         created_by=TEST_USER_ID))
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    result = _cells_for(matrix, row.id)[0]
+    assert result.projected_value == Decimal("999")  # NOT 100 (the row's own rule)
+    assert result.effective_source == "manual"
+
+
+def test_lock_override_with_no_captured_value_resolves_to_none(db):
+    """A lock created without ever capturing a value (the old, broken
+    contract) locks to nothing rather than silently falling back to the
+    row's rule — "locked empty" is still locked, not un-ignored."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Bloqueada sin captura", sort_order=0,
+                    default_projection_rule={"type": "constant", "value": 100})
+    db.add(row)
+    db.commit()
+    period = _get_periods(db, sheet.id)[0]
+
+    cell = SheetCell(row_id=row.id, period_id=period.id)
+    db.add(cell)
+    db.flush()
+    db.add(CellOverride(cell_id=cell.id, value=None, override_type="lock", created_by=TEST_USER_ID))
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    result = _cells_for(matrix, row.id)[0]
+    assert result.projected_value is None
+    assert result.effective_source == "manual"
