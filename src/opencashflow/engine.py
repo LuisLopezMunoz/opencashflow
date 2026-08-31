@@ -53,6 +53,37 @@ Supported rules in V1:
                         same-period dependency — it only ever reads
                         already-resolved prior periods, so it cannot
                         participate in an intra-period cycle.
+  - carry_forward     { "type": "carry_forward", "base_rule": { ... } }
+                        value = evaluate(base_rule, this period)
+                                + max(0, this row's own pending_value in the
+                                  PREVIOUS period), where pending_value is
+                                  accrued_value - paid_value (only when BOTH
+                                  are present on that cell — see
+                                  _real_fields; None otherwise, and a None
+                                  pending contributes 0, same as "nothing to
+                                  carry"). Only a positive pending amount is
+                                  carried forward — an over-payment (negative
+                                  pending) is never subtracted back out.
+                        If there is no previous period at all (first period
+                        in sort order), the carried amount is 0. If the
+                        base_rule has no data AND there's nothing positive
+                        to carry, the whole cell resolves to None (empty) —
+                        exactly like every other "no data" case in this
+                        engine; it only ever returns a value when at least
+                        one side actually contributed something.
+                        base_rule may be any other rule type EXCEPT
+                        carry_forward itself — nesting is rejected with
+                        error="unsupported_rule:carry_forward(nested)"
+                        rather than recursing (there's no legitimate use
+                        case, and it would need extra cycle bookkeeping this
+                        design doesn't cover).
+                        Like previous_period and rolling_average, the
+                        carry-forward reach into the previous period NEVER
+                        creates a same-period dependency by itself — only
+                        base_rule's own same-period references (e.g. if
+                        base_rule is sum_rows or percent_of_row) do, and
+                        those are still picked up by
+                        _extract_same_period_deps recursing into base_rule.
 
 Rules deferred to later iterations:
   - running_balance, ledger_aggregate
@@ -128,6 +159,13 @@ def _extract_same_period_deps(rule: Optional[Dict]) -> List[int]:
     if rule_type == "percent_of_row":
         row_id = rule.get("row_id")
         return [row_id] if row_id is not None else []
+    if rule_type == "carry_forward":
+        # carry_forward's OWN cross-period read (this row's pending_value in
+        # the previous period) never creates a dependency, exactly like
+        # previous_period/rolling_average. But its base_rule might (e.g. a
+        # sum_rows or percent_of_row base_rule) — those deps still need to
+        # be registered so cycle detection sees them.
+        return _extract_same_period_deps(rule.get("base_rule"))
     return []
 
 
@@ -194,10 +232,16 @@ def _evaluate_rule(
     sorted_period_ids: List[int],  # all period ids in sort order
     computed: Dict[Tuple[int, int], Optional[Decimal]],  # (row_id, period_id) → value
     row_signs: Dict[int, int],  # row_id → +1 (positive) / -1 (negative)
+    real_pending: Dict[Tuple[int, int], Optional[Decimal]],  # (row_id, period_id) → accrued - paid (or None)
 ) -> Tuple[Optional[Decimal], str, Optional[str]]:
     """Evaluate a single rule and return (value, source_label, error).
 
     'computed' holds already-resolved values for other (row, period) pairs.
+    'real_pending' holds each cell's own accrued_value - paid_value (None
+    when either is missing), precomputed up front from cell_map — this is
+    what lets carry_forward read a row's own pending history across periods,
+    the same way 'computed' already lets previous_period/rolling_average
+    read across periods.
     'error' is None for every supported rule type; it is only set to
     "unsupported_rule:<type>" for a rule type this engine does not (yet)
     implement, so callers can tell that apart from a row with no rule at all.
@@ -271,6 +315,30 @@ def _evaluate_rule(
         if not values:
             return None, EffectiveSource.EMPTY, None
         return sum(values) / Decimal(len(values)), EffectiveSource.RULE, None
+
+    if rule_type == "carry_forward":
+        base_rule = rule.get("base_rule")
+        if base_rule and base_rule.get("type") == "carry_forward":
+            # No legitimate use case for nesting, and it would need extra
+            # cycle bookkeeping this design doesn't cover — reject instead
+            # of recursing.
+            return None, EffectiveSource.EMPTY, "unsupported_rule:carry_forward(nested)"
+        current_index = sorted_period_ids.index(period_id)
+        if current_index == 0:
+            carried = None
+        else:
+            prev_period_id = sorted_period_ids[current_index - 1]
+            carried = real_pending.get((row_id, prev_period_id))
+        carried_amount = carried if (carried is not None and carried > 0) else Decimal("0")
+        base_value, base_source, base_error = _evaluate_rule(
+            base_rule or {}, row_id, period_id, sorted_period_ids, computed, row_signs, real_pending
+        )
+        if base_error:
+            return None, EffectiveSource.EMPTY, base_error
+        if base_value is None and carried_amount == 0:
+            return None, EffectiveSource.EMPTY, None
+        base_amount = base_value if base_value is not None else Decimal("0")
+        return base_amount + carried_amount, EffectiveSource.RULE, None
 
     # Unsupported rule type — surfaced as an error, not a silent empty cell.
     return None, EffectiveSource.EMPTY, f"unsupported_rule:{rule_type}"
@@ -347,6 +415,18 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
     cell_map: Dict[Tuple[int, int], SheetCell] = {
         (c.row_id, c.period_id): c for c in all_cells
     }
+
+    # Precompute each cell's own pending_value (accrued_value - paid_value,
+    # only when BOTH are present — mirrors _real_fields exactly) up front so
+    # a RULE (carry_forward) can read a row's own pending history across
+    # periods, the same way 'computed' already lets previous_period/
+    # rolling_average read across periods.
+    real_pending: Dict[Tuple[int, int], Optional[Decimal]] = {}
+    for (row_id, period_id), cell in cell_map.items():
+        if cell.accrued_value is not None and cell.paid_value is not None:
+            real_pending[(row_id, period_id)] = cell.accrued_value - cell.paid_value
+        else:
+            real_pending[(row_id, period_id)] = None
 
     # For each row determine its effective rule per period
     # effective_rules[(row_id, period_id)] = (rule_dict or None, is_manual_value, manual_value)
@@ -460,6 +540,7 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
                         sorted_period_ids=sorted_period_ids,
                         computed=computed,
                         row_signs=row_signs,
+                        real_pending=real_pending,
                     )
                     computed[key] = val
                     results_by_row_period[key] = CellResult(

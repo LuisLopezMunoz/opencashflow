@@ -92,6 +92,23 @@ Define **cómo calcular** el valor proyectado de una celda cuando no hay overrid
 // nunca crea una dependencia intra-período — solo lee períodos YA
 // resueltos, así que no participa en la detección de ciclos.
 
+{ "type": "carry_forward", "base_rule": { "type": "constant", "value": 700 } }
+// value = evaluate(base_rule, ESTE período) + max(0, pending_value de ESTA
+// MISMA fila en el período ANTERIOR), donde pending_value es
+// accrued_value - paid_value (solo cuando AMBOS están presentes en esa
+// celda — igual que _real_fields; si no, no se arrastra nada). Solo se
+// arrastra un pendiente POSITIVO — un pago en exceso (pendiente negativo)
+// nunca se resta. Si no hay período anterior (primer período de la
+// planilla), lo arrastrado es 0. Si base_rule no tiene dato Y no hay nada
+// positivo que arrastrar, la celda entera resuelve a vacío (igual que
+// cualquier otro caso "sin dato" del motor). base_rule puede ser cualquier
+// otra regla EXCEPTO carry_forward — anidar se rechaza con
+// error="unsupported_rule:carry_forward(nested)" en vez de recursar.
+// Igual que previous_period y rolling_average, el propio salto al período
+// anterior NUNCA crea una dependencia intra-período — solo las
+// dependencias del MISMO período que traiga base_rule (p. ej. si
+// base_rule es sum_rows o percent_of_row) sí se registran.
+
 { "type": "empty" }
 ```
 

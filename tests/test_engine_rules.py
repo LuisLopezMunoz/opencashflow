@@ -11,6 +11,9 @@ They cover the rules added to unlock a real running balance:
   5. percent_of_row computes correctly and does participate in cycle detection.
   6. An unsupported rule type sets error="unsupported_rule:<type>" instead of
      silently returning an empty cell.
+  7. carry_forward adds a row's own positive pending (accrued - paid) from
+     the previous period on top of its base_rule value, recurses into
+     base_rule for cycle detection, and rejects nesting.
 """
 from datetime import datetime
 from decimal import Decimal
@@ -460,6 +463,152 @@ def test_lock_override_freezes_the_value_like_manual_value(db):
     result = _cells_for(matrix, row.id)[0]
     assert result.projected_value == Decimal("999")  # NOT 100 (the row's own rule)
     assert result.effective_source == "manual"
+
+
+# ---------------------------------------------------------------------------
+# 10: carry_forward — value = base_rule(this period) + max(0, this row's own
+#     pending_value (accrued - paid) in the PREVIOUS period).
+# ---------------------------------------------------------------------------
+
+def test_carry_forward_adds_positive_pending_from_previous_period(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=2)
+    section = _make_section(db, sheet)
+    periods = _get_periods(db, sheet.id)
+
+    row = SheetRow(section_id=section.id, name="Arriendo", sort_order=0,
+                    default_projection_rule={"type": "carry_forward",
+                                              "base_rule": {"type": "constant", "value": 500}})
+    db.add(row)
+    db.commit()
+
+    # Previous period: accrued 500, paid only 300 -> 200 still pending.
+    prev_cell = SheetCell(row_id=row.id, period_id=periods[0].id,
+                           accrued_value=Decimal("500"), paid_value=Decimal("300"))
+    db.add(prev_cell)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    # Period 0 has no previous period, so it's just the base_rule value.
+    assert cells[0].projected_value == Decimal("500")
+    # Period 1 = base_rule (500) + carried pending (500 - 300 = 200) = 700.
+    assert cells[1].projected_value == Decimal("700")
+    assert cells[1].error is None
+    assert cells[1].effective_source == "rule"
+
+
+def test_carry_forward_with_nothing_pending_adds_zero(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=2)
+    section = _make_section(db, sheet)
+    periods = _get_periods(db, sheet.id)
+
+    row = SheetRow(section_id=section.id, name="Arriendo", sort_order=0,
+                    default_projection_rule={"type": "carry_forward",
+                                              "base_rule": {"type": "constant", "value": 500}})
+    db.add(row)
+    db.commit()
+
+    # Previous period: accrued == paid -> nothing pending.
+    prev_cell = SheetCell(row_id=row.id, period_id=periods[0].id,
+                           accrued_value=Decimal("500"), paid_value=Decimal("500"))
+    db.add(prev_cell)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    assert cells[1].projected_value == Decimal("500")
+    assert cells[1].error is None
+
+
+def test_carry_forward_with_no_accrued_or_paid_recorded_passes_base_value_through(db):
+    """A previous period with NO accrued/paid at all (the common case before
+    a ledger bridge writes anything) is None pending, not 0 owed -- but
+    either way it must not raise and must not add anything to the base
+    value."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=2)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Arriendo", sort_order=0,
+                    default_projection_rule={"type": "carry_forward",
+                                              "base_rule": {"type": "constant", "value": 500}})
+    db.add(row)
+    db.commit()
+    # No SheetCell at all for period 0 -- cell_map has nothing to key off.
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    assert cells[0].projected_value == Decimal("500")
+    assert cells[1].projected_value == Decimal("500")
+    assert cells[1].error is None
+
+
+def test_carry_forward_on_first_period_behaves_like_base_rule_alone(db):
+    """No previous period exists at all (sorted_period_ids.index() would be
+    0) -- must not crash and must carry exactly 0."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Arriendo", sort_order=0,
+                    default_projection_rule={"type": "carry_forward",
+                                              "base_rule": {"type": "constant", "value": 500}})
+    db.add(row)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    assert cells[0].projected_value == Decimal("500")
+    assert cells[0].error is None
+
+
+def test_carry_forward_base_rule_sum_rows_dependency_is_detected(db):
+    """carry_forward wrapping sum_rows must still register sum_rows' own
+    same-period dependencies via _extract_same_period_deps recursing into
+    base_rule -- without that recursion this would silently blank out
+    instead of correctly resolving."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    a = SheetRow(section_id=section.id, name="A", sort_order=0,
+                 default_projection_rule={"type": "constant", "value": 100})
+    b = SheetRow(section_id=section.id, name="B", sort_order=1,
+                 default_projection_rule={"type": "constant", "value": 50})
+    total = SheetRow(section_id=section.id, name="Total", sort_order=2)
+    db.add_all([a, b, total])
+    db.flush()
+    total.default_projection_rule = {
+        "type": "carry_forward",
+        "base_rule": {"type": "sum_rows", "row_ids": [a.id, b.id]},
+    }
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    total_cells = _cells_for(matrix, total.id)
+    # If the recursion into base_rule were missing, "Total" would not be
+    # ordered after A/B in the topo sort and sum_rows would see nothing
+    # computed yet, resolving to None instead of 150.
+    assert total_cells[0].projected_value == Decimal("150")
+    assert total_cells[0].error is None
+
+
+def test_carry_forward_nested_is_rejected_as_unsupported(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Anidada", sort_order=0,
+                    default_projection_rule={
+                        "type": "carry_forward",
+                        "base_rule": {
+                            "type": "carry_forward",
+                            "base_rule": {"type": "constant", "value": 100},
+                        },
+                    })
+    db.add(row)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    assert cells[0].projected_value is None
+    assert cells[0].error == "unsupported_rule:carry_forward(nested)"
 
 
 def test_lock_override_with_no_captured_value_resolves_to_none(db):
