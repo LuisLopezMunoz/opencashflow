@@ -256,3 +256,53 @@ def test_unsupported_rule_sets_error(db):
     cells = _cells_for(matrix, row.id)
     assert cells[0].projected_value is None
     assert cells[0].error == "unsupported_rule:rolling_average"
+
+
+# ---------------------------------------------------------------------------
+# 7: actual_value/accrued_value/paid_value already stored on a cell pass
+#    through, and pending_value/variance are derived from them.
+# ---------------------------------------------------------------------------
+
+def test_actual_value_and_variance_pass_through(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Vivienda", sort_order=0,
+                    default_projection_rule={"type": "constant", "value": 400})
+    db.add(row)
+    db.commit()
+    period = _get_periods(db, sheet.id)[0]
+
+    cell = SheetCell(row_id=row.id, period_id=period.id,
+                      actual_value=Decimal("435.80"),
+                      accrued_value=Decimal("500"), paid_value=Decimal("300"))
+    db.add(cell)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    result = _cells_for(matrix, row.id)[0]
+    assert result.projected_value == Decimal("400")
+    assert result.actual_value == Decimal("435.80")
+    assert result.variance == Decimal("35.80")
+    assert result.accrued_value == Decimal("500")
+    assert result.paid_value == Decimal("300")
+    assert result.pending_value == Decimal("200")
+
+
+def test_actual_value_absent_leaves_variance_none(db):
+    """A cell with no real data recorded (the common case before a ledger
+    bridge exists) must not error or fabricate a variance."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Sin datos reales", sort_order=0,
+                    default_projection_rule={"type": "constant", "value": 100})
+    db.add(row)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    result = _cells_for(matrix, row.id)[0]
+    assert result.projected_value == Decimal("100")
+    assert result.actual_value is None
+    assert result.variance is None
+    assert result.pending_value is None

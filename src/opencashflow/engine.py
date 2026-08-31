@@ -150,6 +150,26 @@ def _detect_cycles(
     return in_cycle
 
 
+def _real_fields(cell: Optional[SheetCell], projected_value: Optional[Decimal]) -> Dict[str, Optional[Decimal]]:
+    """Pass through the 'real' fields already stored on a cell and derive the
+    two computed ones (pending_value, variance) from them.
+
+    None propagates rather than raising: a cell that hasn't been
+    materialized yet, or one where actual/accrued/paid haven't been written,
+    is a normal, common state -- not an error. Whatever writes actual_value
+    (a manual entry, or a future ledger bridge) is outside the engine; this
+    only reads what's already on the row.
+    """
+    if cell is None:
+        return {"actual_value": None, "accrued_value": None, "paid_value": None,
+                "pending_value": None, "variance": None}
+    actual, accrued, paid = cell.actual_value, cell.accrued_value, cell.paid_value
+    pending = (accrued - paid) if accrued is not None and paid is not None else None
+    variance = (actual - projected_value) if actual is not None and projected_value is not None else None
+    return {"actual_value": actual, "accrued_value": accrued, "paid_value": paid,
+            "pending_value": pending, "variance": variance}
+
+
 def _evaluate_rule(
     rule: Dict,
     row_id: int,
@@ -373,6 +393,7 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
                     period_id=period.id,
                     projected_value=val,
                     effective_source=EffectiveSource.MANUAL,
+                    **_real_fields(cell_map.get(key), val),
                 )
             else:
                 rule = effective_rules.get(key)
@@ -383,6 +404,7 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
                         period_id=period.id,
                         projected_value=None,
                         effective_source=EffectiveSource.EMPTY,
+                        **_real_fields(cell_map.get(key), None),
                     )
                 else:
                     val, source, rule_error = _evaluate_rule(
@@ -401,9 +423,13 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
                         projected_value=val,
                         effective_source=source,
                         error=rule_error,
+                        **_real_fields(cell_map.get(key), val),
                     )
 
-        # Then mark cyclic rows
+        # Then mark cyclic rows. The cycle only invalidates the PROJECTION --
+        # any real data already recorded on the cell is still legitimate and
+        # still surfaces (variance is None regardless, since there's no
+        # projected_value to compare against).
         for row_id in cyclic_rows:
             key = (row_id, period.id)
             computed[key] = None
@@ -413,6 +439,7 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
                 projected_value=None,
                 effective_source=EffectiveSource.EMPTY,
                 error="cycle_detected",
+                **_real_fields(cell_map.get(key), None),
             )
 
     # Assemble final structure

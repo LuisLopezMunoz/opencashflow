@@ -125,8 +125,8 @@ Caché persistente del valor efectivo final de una celda, con traza de qué fuen
 Este paquete **no tiene usuarios, autenticación, ni un ledger de transacciones reales**. Deliberadamente:
 
 - `CashflowSheet.user_id` y `CellOverride.created_by` son columnas `Integer` simples, sin `ForeignKey`. La app que use este paquete es dueña de su propio modelo de usuario y de garantizar que esos ids sean válidos.
-- `SheetRow.ledger_mapping` (JSON) es un contrato declarativo — describe *cómo* debería leerse un dato real (p. ej. `{"category": "housing", "type": "expense"}`) — pero este paquete **nunca lo interpreta ni ejecuta una consulta con él**. Poblar `actual_value`/`accrued_value`/`paid_value` a partir de datos reales es responsabilidad exclusiva de la app consumidora (su propio "ledger bridge").
-- `compute_sheet()` calcula únicamente `projected_value` a partir de reglas y overrides. Todo lo demás en `SheetCell` que no sea proyección lo escribe otro código, fuera de este paquete.
+- `SheetRow.ledger_mapping` (JSON) es un contrato declarativo — describe *cómo* debería leerse un dato real (p. ej. `{"category": "housing", "type": "expense"}`) — pero este paquete **nunca lo interpreta ni ejecuta una consulta con él**. Poblar `actual_value`/`accrued_value`/`paid_value` a partir de datos reales (manualmente o vía un futuro "ledger bridge") es responsabilidad exclusiva de la app consumidora.
+- `compute_sheet()` calcula `projected_value` a partir de reglas y overrides. `actual_value`/`accrued_value`/`paid_value` los toma tal cual estén ya guardados en la celda (o `None` si nadie los escribió todavía) y a partir de ellos sí calcula `pending_value` (`accrued_value - paid_value`) y `variance` (`actual_value - projected_value`) — ambos quedan en `None` si falta cualquiera de sus componentes, nunca se fuerza un resultado.
 
 ## Regla de oro: forecast vs. real
 
