@@ -36,9 +36,22 @@ Supported rules in V1:
                         Same-period reference → DOES create a dependency edge
                         and participates in cycle detection (unlike
                         previous_period).
+  - rolling_average   { "type": "rolling_average", "n": <int> }
+                        Average of this row's own value over the last N
+                        periods (walking backward from the period being
+                        evaluated). Periods with no value are skipped —
+                        both from the sum and from the count — rather than
+                        counted as 0, so a short history doesn't drag the
+                        average down artificially. Resolves to None (empty)
+                        if none of the last N periods have a value, e.g. at
+                        the very start of a sheet with no history at all.
+                        Like previous_period, this NEVER creates a
+                        same-period dependency — it only ever reads
+                        already-resolved prior periods, so it cannot
+                        participate in an intra-period cycle.
 
 Rules deferred to later iterations:
-  - rolling_average, running_balance, ledger_aggregate
+  - running_balance, ledger_aggregate
   Any other/unknown rule type resolves to None (effective_source="empty")
   AND sets error="unsupported_rule:<type>" on the cell, so it is
   distinguishable from a row that was intentionally left without a rule.
@@ -233,6 +246,24 @@ def _evaluate_rule(
             return None, EffectiveSource.EMPTY, None
         value = base_value * Decimal(str(percent)) / Decimal("100")
         return value, EffectiveSource.RULE, None
+
+    if rule_type == "rolling_average":
+        n = rule.get("n")
+        if not n or n <= 0:
+            return None, EffectiveSource.EMPTY, None
+        current_index = sorted_period_ids.index(period_id)
+        values: List[Decimal] = []
+        for offset in range(1, n + 1):
+            prev_index = current_index - offset
+            if prev_index < 0:
+                break
+            prev_period_id = sorted_period_ids[prev_index]
+            v = computed.get((row_id, prev_period_id))
+            if v is not None:
+                values.append(v)
+        if not values:
+            return None, EffectiveSource.EMPTY, None
+        return sum(values) / Decimal(len(values)), EffectiveSource.RULE, None
 
     # Unsupported rule type — surfaced as an error, not a silent empty cell.
     return None, EffectiveSource.EMPTY, f"unsupported_rule:{rule_type}"

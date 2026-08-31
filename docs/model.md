@@ -82,6 +82,16 @@ Define **cómo calcular** el valor proyectado de una celda cuando no hay overrid
 // A diferencia de previous_period, sí crea una dependencia intra-período
 // y participa en la detección de ciclos.
 
+{ "type": "rolling_average", "n": 3 }
+// Promedio del valor de ESTA MISMA fila en los últimos N períodos,
+// caminando hacia atrás desde el período evaluado. Los períodos sin valor
+// se saltan (no cuentan como 0, ni en la suma ni en el denominador) — un
+// historial corto no diluye el promedio artificialmente. Si ninguno de los
+// últimos N períodos tiene valor (p. ej. al principio de una planilla sin
+// historial), resuelve a vacío, no a error. Igual que previous_period,
+// nunca crea una dependencia intra-período — solo lee períodos YA
+// resueltos, así que no participa en la detección de ciclos.
+
 { "type": "empty" }
 ```
 
@@ -91,7 +101,6 @@ celda a `null` con `effective_source="empty"` **y** `error="unsupported_rule:<ty
 para que se distinga de una fila que deliberadamente no tiene regla):
 
 ```jsonc
-{ "type": "rolling_average", "n": 3 }
 { "type": "running_balance", "initial_balance_row_id": 99 }
 { "type": "ledger_aggregate", "ledger_mapping": { "category": "housing", "type": "expense" } }
 ```

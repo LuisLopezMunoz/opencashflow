@@ -245,9 +245,11 @@ def test_unsupported_rule_sets_error(db):
 
     row = SheetRow(
         section_id=section.id,
-        name="Rolling Average Row",
+        name="Running Balance Row",
         sort_order=0,
-        default_projection_rule={"type": "rolling_average", "n": 3},
+        # running_balance is still deferred (unlike rolling_average, which
+        # this file also tests below).
+        default_projection_rule={"type": "running_balance", "initial_balance_row_id": 1},
     )
     db.add(row)
     db.commit()
@@ -255,7 +257,86 @@ def test_unsupported_rule_sets_error(db):
     matrix = compute_sheet(sheet.id, db)
     cells = _cells_for(matrix, row.id)
     assert cells[0].projected_value is None
-    assert cells[0].error == "unsupported_rule:rolling_average"
+    assert cells[0].error == "unsupported_rule:running_balance"
+
+
+# ---------------------------------------------------------------------------
+# 6b: rolling_average — averages the last N periods, skipping (not zeroing)
+#     any that have no value, and resolving to None with no history at all.
+# ---------------------------------------------------------------------------
+
+def test_rolling_average_of_full_history(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=5)
+    section = _make_section(db, sheet)
+    periods = _get_periods(db, sheet.id)
+
+    row = SheetRow(section_id=section.id, name="Gastos comunes", sort_order=0,
+                    default_projection_rule={"type": "rolling_average", "n": 3})
+    db.add(row)
+    db.commit()
+
+    # Seed 3 months of known history via manual overrides (periods 0-2),
+    # leave periods 3-4 to be projected by the rule.
+    for period, value in zip(periods[:3], [Decimal("100"), Decimal("200"), Decimal("300")]):
+        cell = SheetCell(row_id=row.id, period_id=period.id)
+        db.add(cell)
+        db.flush()
+        db.add(CellOverride(cell_id=cell.id, value=value, override_type="manual_value", created_by=TEST_USER_ID))
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    assert cells[0].projected_value == Decimal("100")
+    assert cells[1].projected_value == Decimal("200")
+    assert cells[2].projected_value == Decimal("300")
+    # Period 3 averages the 3 known periods (100+200+300)/3 = 200.
+    assert cells[3].projected_value == Decimal("200")
+    # Period 4 averages periods 1-3 (200+300+200)/3, now including the
+    # ROLLING result from period 3, not the raw seed values only.
+    assert cells[4].projected_value == (Decimal("200") + Decimal("300") + Decimal("200")) / Decimal("3")
+    for c in cells:
+        assert c.error is None
+
+
+def test_rolling_average_skips_missing_periods_instead_of_zeroing(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=4)
+    section = _make_section(db, sheet)
+    periods = _get_periods(db, sheet.id)
+
+    row = SheetRow(section_id=section.id, name="Agua", sort_order=0,
+                    default_projection_rule={"type": "rolling_average", "n": 3})
+    db.add(row)
+    db.commit()
+
+    # Only ONE period of history exists (period 0 = 90); periods 1-2 have no
+    # value at all. A naive average-of-3-including-zeros would compute 30;
+    # skipping the missing ones must give exactly 90 (the single real value).
+    cell = SheetCell(row_id=row.id, period_id=periods[0].id)
+    db.add(cell)
+    db.flush()
+    db.add(CellOverride(cell_id=cell.id, value=Decimal("90"), override_type="manual_value", created_by=TEST_USER_ID))
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    assert cells[1].projected_value == Decimal("90")
+    assert cells[1].error is None
+
+
+def test_rolling_average_with_no_history_is_empty_not_error(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    row = SheetRow(section_id=section.id, name="Sin historial", sort_order=0,
+                    default_projection_rule={"type": "rolling_average", "n": 3})
+    db.add(row)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    cells = _cells_for(matrix, row.id)
+    assert cells[0].projected_value is None
+    assert cells[0].error is None
+    assert cells[0].effective_source == "empty"
 
 
 # ---------------------------------------------------------------------------
