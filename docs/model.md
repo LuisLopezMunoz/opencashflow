@@ -12,7 +12,7 @@ La planilla raíz. Pertenece a un `user_id` (un entero simple: este paquete no m
 ### SheetPeriod
 Cada **columna** de la planilla. Representa un mes calendario (día siempre = 1 del mes). Los períodos se generan automáticamente al crear la planilla (`opencashflow.periods.generate_periods`) según `base_period` + `horizon_months`. También se puede extender una planilla ya creada con períodos históricos ANTERIORES al primero existente, vía `opencashflow.periods.extend_periods_backward(sheet, months, db)` — componible (llamarla varias veces da historia contigua), idempotente por fecha, y marca los períodos creados con `is_closed=True`. `opencashflow.periods.find_anchor_period(periods, today=None)` resuelve cuál período tratar como "ahora" para vistas relativas (equivalente al período que matchea el mes actual, o el futuro más cercano, o el más reciente si toda la planilla quedó en el pasado).
 
-`is_closed` es un flag explícito de un solo sentido (`False` → `True`), nunca recalculado a partir de la fecha de hoy — no existe un estado "cerrado" implícito derivado de `period_date < hoy`. Se llega a `True` por exactamente dos caminos, ambos irreversibles hoy (no hay "reabrir"): (1) `extend_periods_backward` lo marca así en los períodos históricos que crea (scaffold de calendario puro, sin reconciliación); (2) la operación de cierre de la app consumidora (ver `period_close` en `opencashflow-app`) lo marca así después de reconciliar ese período contra los valores reales.
+`is_closed` es un flag explícito de un solo sentido (`False` → `True`), nunca recalculado a partir de la fecha de hoy — no existe un estado "cerrado" implícito derivado de `period_date < hoy`. Se llega a `True` por exactamente dos caminos, ambos irreversibles hoy (no hay "reabrir"): (1) `extend_periods_backward` lo marca así en los períodos históricos que crea (scaffold de calendario puro, sin reconciliación); (2) `opencashflow.period_close.close_period` (ver más abajo) lo marca así después de reconciliar ese período contra los valores reales.
 
 - **Período futuro**: `is_closed=False` y aún no hay datos reales cargados. Muestra únicamente el valor proyectado.
 - **Período actual/en curso**: `is_closed=False`, con datos reales (`actual_value`/`accrued_value`/`paid_value`) que se van registrando a medida que ocurren. Muestra proyectado y real en paralelo — ninguno sobreescribe al otro (ver "Regla de oro" más abajo).
@@ -195,6 +195,54 @@ La planilla proyecta y explica; el valor real (poblado por la app consumidora) r
 5. Sin regla aplicable
        → effective_value = NULL (vacío).
 ```
+
+---
+
+## Resolución de signo (`opencashflow.engine`)
+
+`row_sign_multiplier`, `build_sum_rows_hierarchy` y `effective_sign_to_top` generalizan la
+misma lógica de signo que `sum_rows` ya aplica un nivel a la vez (ver el catálogo de reglas
+arriba) en un recorrido completo hasta la raíz: "si esta fila sube en una unidad, ¿el total
+final sube o baja?". Sirve para que una app consumidora sepa, por ejemplo, hacia qué lado debe
+mover un saldo externo (una cuenta bancaria, una caja) cuando se liquida una fila, sin tener
+que codificar esa dirección a mano fila por fila. `effective_sign_to_top` devuelve `None`
+(nunca `0`) cuando la fila no tiene ningún `sum_rows` que la sume hacia el total — significa
+"sin efecto conocido", no "se cancela".
+
+## Cierre de período (`opencashflow.period_close`)
+
+`close_period(db, sheet, period, acting_user_id, ...)` reconcilia un período contra la
+realidad: congela el "saldo final" (la fila que la regla `previous_period` de la fila de saldo
+apunta como `row_id`) en el número real, y arrastra al período siguiente cualquier monto
+pendiente (`accrued_value - paid_value`) de las filas que no usan `carry_forward` (esas se
+autocorrigen solas). Nunca lanza `sys.exit` ni ninguna excepción de framework web — solo
+`ValueError` en cada guarda (período ya cerrado, períodos anteriores sin cerrar, saldo inicial
+sin valor proyectado). `dry_run=True` corre exactamente el mismo camino de escritura y hace
+`rollback()` al final, así el preview nunca puede desincronizarse de un cierre real.
+
+## Registro real: deshacer (`opencashflow.record_stack`)
+
+Como `CellActualEntry` es de solo-inserción (nunca se edita ni se borra), "deshacer" el último
+valor real registrado en una celda no puede simplemente borrar una fila — tiene que agregar una
+nueva que restaure el estado anterior. `replay_record_stack`/`pop_record_stack` leen el
+historial de una celda como una pila push/pop (una entrada marcada como el resultado de un
+`pop_record_stack` anterior hace *pop* en vez de *push*), así que deshacer dos veces seguidas
+camina hacia atrás correctamente en vez de rebotar entre los mismos dos valores.
+`guard_periods_not_closed` rechaza cualquier intento de tocar el registro real de un período ya
+cerrado.
+
+## Wallet / WalletMovement (`opencashflow.wallet`)
+
+Una `Wallet` es una cuenta de efectivo real que el dueño de una planilla efectivamente tiene
+(un banco, la billetera física, una cuenta de ahorro) — el motor por sí solo no tiene ningún
+concepto de "cuánta plata hay de verdad", solo sabe de valores proyectados/reales por celda.
+Un `WalletMovement` (`opencashflow.wallet_movements.do_wallet_movement_add`) es un solo evento
+real que abona o descuenta una `Wallet` **y** registra la fila correspondiente como real, de
+forma atómica — la dirección (¿suma o resta de la billetera?) nunca se pide explícita, se
+deriva del `effective_sign_to_top` de la fila. `do_wallet_movement_undo` revierte ambos lados a
+la vez (la billetera y la celda, un paso atrás en su propia pila de `record_stack`), y se
+niega si algo más nuevo quedó encima o si el movimiento ya fue revertido antes — los
+movimientos son, igual que `CellActualEntry`, un log de solo-inserción.
 
 ---
 
