@@ -1,0 +1,212 @@
+sheet:
+  name: Flujo de Caja Personal
+  currency: CLP
+  horizon_months: 12
+  base_period: '2026-01-01'
+sections:
+- name: Saldo Inicial
+  section_type: balance
+  rows:
+  - name: SALDO INICIAL
+    row_type: running_balance
+    sign: positive
+    rule:
+      type: previous_period
+      row_id: SALDO FINAL
+- name: Ingresos
+  section_type: income
+  rows:
+  - name: Sueldo líquido
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 2400000
+  - name: Boletas freelance
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 350000
+  - name: Arriendo depto
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 280000
+  - name: Total Ingresos
+    row_type: subtotal
+    sign: positive
+    rule:
+      type: sum_rows
+      row_ids:
+      - Sueldo líquido
+      - Boletas freelance
+      - Arriendo depto
+- name: Gastos Fijos
+  section_type: expense
+  rows:
+  - name: Dividendo hipotecario
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 650000
+  - name: Servicios básicos
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 145000
+  - name: Internet y celular
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 55000
+  - name: Colegio
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 280000
+  - name: Seguros
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 85000
+  - name: Total Gastos Fijos
+    row_type: subtotal
+    sign: negative
+    rule:
+      type: sum_rows
+      row_ids:
+      - Dividendo hipotecario
+      - Servicios básicos
+      - Internet y celular
+      - Colegio
+      - Seguros
+- name: Gastos Variables
+  section_type: expense
+  rows:
+  - name: Supermercado
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 620000
+  - name: Transporte y bencina
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 180000
+  - name: Salud
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 90000
+  - name: Ocio
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 140000
+  - name: Total Gastos Variables
+    row_type: subtotal
+    sign: negative
+    rule:
+      type: sum_rows
+      row_ids:
+      - Supermercado
+      - Transporte y bencina
+      - Salud
+      - Ocio
+- name: Impuestos y Patentes
+  section_type: expense
+  rows:
+  - name: Contribuciones
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 0
+  - name: Permiso de circulación
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 0
+  - name: Seguro automotriz
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 0
+  - name: Total Impuestos
+    row_type: subtotal
+    sign: negative
+    rule:
+      type: sum_rows
+      row_ids:
+      - Contribuciones
+      - Permiso de circulación
+      - Seguro automotriz
+- name: Financiamiento
+  section_type: financing
+  rows:
+  - name: Cuota crédito de consumo
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 185000
+  - name: Pago tarjeta de crédito
+    row_type: input
+    sign: positive
+    rule:
+      type: constant
+      value: 240000
+  - name: Total Financiamiento
+    row_type: subtotal
+    sign: negative
+    rule:
+      type: sum_rows
+      row_ids:
+      - Cuota crédito de consumo
+      - Pago tarjeta de crédito
+- name: Resumen
+  section_type: balance
+  rows:
+  - name: Ahorro programado
+    row_type: formula
+    sign: negative
+    rule:
+      type: percent_of_row
+      row_id: Total Ingresos
+      percent: 10
+  - name: Imprevistos
+    row_type: input
+    sign: positive
+  - name: FLUJO NETO DEL MES
+    row_type: total
+    sign: positive
+    rule:
+      type: sum_rows
+      row_ids:
+      - Total Ingresos
+      - Total Gastos Fijos
+      - Total Gastos Variables
+      - Total Impuestos
+      - Total Financiamiento
+      - Ahorro programado
+  - name: SALDO FINAL
+    row_type: running_balance
+    sign: positive
+    rule:
+      type: sum_rows
+      row_ids:
+      - SALDO INICIAL
+      - FLUJO NETO DEL MES

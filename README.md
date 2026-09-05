@@ -19,7 +19,44 @@ pip install "opencashflow @ git+https://github.com/LuisLopezMunoz/opencashflow.g
 
 (Todavía no está publicado en PyPI — instalar directamente desde el repositorio.)
 
-## Uso mínimo
+Esto también instala el comando `opencashflow` (equivalente a `python -m
+opencashflow.cli`) -- una CLI standalone, independiente de cualquier app consumidora
+(sin ledger, sin tarjetas de crédito, sin auth multiusuario), útil para probar la
+librería o correr el demo de abajo.
+
+## Demo en un minuto
+
+```bash
+opencashflow seed --user-id 1 --months 12 --base-period 2026-01
+opencashflow rows --sheet-id 1
+opencashflow doctor --sheet-id 1
+```
+
+Esto crea (en una base SQLite descartable, `./opencashflow-demo.db` por defecto) una
+planilla de ejemplo realista -- un hogar chileno con ingresos, gastos fijos/variables,
+impuestos, financiamiento y un saldo acumulado -- y lista sus filas y reglas. (`show`,
+el renderizador de tabla completo, no está en la CLI standalone -- es una de las pocas
+funciones que se quedaron del lado de una app consumidora real; ver
+[docs/model.md](docs/model.md), sección "CLI genérico".)
+
+El mismo ejemplo vive como archivo declarativo en
+[docs/examples/hogar-chileno.yaml](docs/examples/hogar-chileno.yaml) -- una planilla
+completa (secciones → filas → reglas) en un solo documento YAML, generado con `sheet
+export` y reimportable con `sheet import`:
+
+```bash
+opencashflow sheet import --file docs/examples/hogar-chileno.yaml --user-id 1
+opencashflow sheet export --sheet-id 1   # -- lo mismo, de vuelta a YAML, a stdout
+```
+
+Ver [docs/model.md](docs/model.md), sección "Sheet spec", para el formato completo
+(los 6 tipos de regla soportados, cómo se referencian filas por nombre, `sheet
+import`/`export`). Nota: el spec captura la ESTRUCTURA de una planilla (secciones,
+filas, reglas) -- no overrides manuales por celda, que es justamente lo que distingue
+al ejemplo de arriba (generado con `seed`, que sí aplica un par de overrides realistas
+de calendario) del mismo ejemplo reimportado desde el YAML (que empieza sin ellos).
+
+## Uso mínimo (desde Python)
 
 Este paquete no crea usuarios ni conexiones a base de datos por ti — trae tu propia
 `Session` de SQLAlchemy y tu propio `user_id` (un entero simple, sin relación con ningún

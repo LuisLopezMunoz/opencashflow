@@ -263,13 +263,46 @@ de registrar todo por su cuenta.
 
 Desde v0.8.1, este módulo TAMBIÉN tiene su propio `main()`/`if __name__` standalone,
 instalado como el script de consola `opencashflow` (`opencashflow seed`, `opencashflow
-show`, etc., o `python -m opencashflow.cli`) — independiente de cualquier app consumidora:
+rows`, etc., o `python -m opencashflow.cli`) — independiente de cualquier app consumidora:
 sin ledger, sin tarjetas de crédito, sin auth multiusuario, solo la superficie genérica de
 este módulo más un `seed` mínimo propio. Existe para que `register_generic_commands` sea
 ejecutable y probable por sí solo, y para que la librería tenga un demo copy-pasteable sin
 depender de ninguna app real. Una app consumidora sigue armando su propio `main()`/dispatch
 como siempre — `register_generic_commands` nunca despacha, solo arma el parser; el `main()`
-de este módulo es una alternativa standalone, no un reemplazo del de la app.
+de este módulo es una alternativa standalone, no un reemplazo del de la app. Nota: `show`
+(el renderizador de tabla completo) NO está acá -- se quedó del lado de la app consumidora
+(ver la lista de funciones acopladas a `User` más arriba en esta sección).
+
+## Sheet spec (`opencashflow.sheet_spec`)
+
+Desde v0.9.0: un formato declarativo (YAML o JSON) para definir una planilla completa
+(planilla → secciones → filas, cada fila con su regla) en un solo documento, en vez de
+muchas llamadas de CLI o el wizard interactivo. Ver
+[docs/examples/hogar-chileno.yaml](examples/hogar-chileno.yaml) para un ejemplo completo,
+y el README para el flujo de `sheet import`/`sheet export`.
+
+Los 6 tipos de regla tienen un modelo Pydantic cada uno (unión discriminada por `type`),
+con los MISMOS nombres de key que ya lee `opencashflow.engine` (`value`, `row_id`,
+`row_ids`, `percent`, `n`, `base_rule`) — la única diferencia: `row_id`/`row_ids` llevan
+el NOMBRE de la fila (string), no su id, porque al escribir el archivo el id todavía no
+existe. `CarryForwardRuleSpec.base_rule` acepta cualquiera de los otros 5 tipos (igual que
+el motor) EXCEPTO `carry_forward` — anidarlo se rechaza a nivel Pydantic, antes de que el
+motor llegue a verlo.
+
+`import_sheet_spec(db, spec, user_id)` construye la planilla en dos pasadas (mismo patrón
+que `opencashflow.seed.seed_sheet`): la primera crea planilla/secciones/filas sin regla
+todavía y hace flush para que los ids existan, armando un mapa nombre→fila (algo que
+`seed_sheet` nunca necesitó, sus filas son variables Python conocidas de antemano); la
+segunda resuelve cada referencia de nombre (incluida una anidada dentro de
+`carry_forward.base_rule`) contra ese mapa y recién ahí escribe `default_projection_rule`.
+Un nombre de fila duplicado en cualquier parte de la planilla, o una referencia que no
+resuelve, levantan `ValueError` nombrando la fila y el nombre que falta — nunca una
+adivinanza silenciosa.
+
+`export_sheet_spec(db, sheet)` es la dirección inversa (id→nombre) — captura la
+ESTRUCTURA de una planilla (secciones, filas, reglas), nunca overrides manuales por
+celda ni valores reales (`actual`/`accrued`/`paid`), que quedan fuera de este formato a
+propósito: un sheet spec versiona la FORMA de una planilla, no sus datos.
 
 ---
 
