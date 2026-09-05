@@ -599,3 +599,89 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
         "periods": periods,
         "sections": result_sections,
     }
+
+
+# ---------------------------------------------------------------------------
+# Sign resolution -- how a one-unit change in a leaf row ultimately moves the
+# topmost aggregate it rolls into. compute_sheet's own sum_rows evaluation
+# already applies each row's sign ONE level at a time (see the "sum_rows"
+# rule in the module docstring above); these three functions generalize that
+# same reasoning into a full path-to-root walk, for a consuming app that
+# needs to answer "does writing a real value into THIS row make the bottom
+# line go up or down" -- e.g. to decide which direction an external balance
+# (a bank account, a cash box) should move when this row is settled, or to
+# implement the `running_balance` row_type as a running total independent of
+# the sheet's own SALDO INICIAL/SALDO FINAL pair.
+# ---------------------------------------------------------------------------
+
+def row_sign_multiplier(row: SheetRow) -> int:
+    """+1 for row.sign == "positive", -1 otherwise ("negative")."""
+    return 1 if row.sign == "positive" else -1
+
+
+def build_sum_rows_hierarchy(db: Session, sheet_id: int) -> Tuple[Dict[int, SheetRow], Dict[int, int]]:
+    """Returns (rows_by_id, child_to_parent) for every row of the sheet.
+
+    child_to_parent[row_id] = the id of the ONE row whose default_projection_rule
+    is a sum_rows that lists row_id as an operand -- i.e. row_id's immediate
+    parent in the aggregation tree (Sueldo -> Total Ingresos -> Flujo Neto ->
+    Saldo Final, etc). A row absent from this mapping has no known parent:
+    either it's the topmost row (nobody sums it further) or it was never
+    wired into any total.
+
+    Raises ValueError if a row is listed as an operand of MORE than one
+    sum_rows rule -- that would make "how does this row affect the bottom
+    line" ambiguous (which parent's path do you follow?); this never guesses
+    at ambiguity.
+    """
+    rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet_id).all()
+    rows_by_id = {r.id: r for r in rows}
+    child_to_parent: Dict[int, int] = {}
+    for r in rows:
+        rule = r.default_projection_rule
+        if not rule or rule.get("type") != "sum_rows":
+            continue
+        for child_id in rule.get("row_ids", []):
+            existing_parent = child_to_parent.get(child_id)
+            if existing_parent is not None and existing_parent != r.id:
+                other_name = rows_by_id.get(existing_parent).name if existing_parent in rows_by_id else existing_parent
+                raise ValueError(
+                    f"Row #{child_id} appears in the sum_rows of more than one row "
+                    f"('{other_name}' and '{r.name}') -- its effect on the bottom line "
+                    f"cannot be determined unambiguously."
+                )
+            child_to_parent[child_id] = r.id
+    return rows_by_id, child_to_parent
+
+
+def effective_sign_to_top(
+    row_id: int, rows_by_id: Dict[int, SheetRow], child_to_parent: Dict[int, int],
+) -> Optional[int]:
+    """Product of row.sign along the sum_rows chain from row_id up to (but
+    NOT including) the topmost row that nobody's sum_rows references -- i.e.
+    how a one-unit change in this row's raw value ultimately moves the
+    topmost row's raw value (+1 same direction, -1 opposite). The top row's
+    OWN sign is deliberately excluded: it would only matter if something
+    summed the top row too, which by definition nothing does.
+
+    Returns None if row_id itself has no parent at all -- it was never wired
+    into any sum_rows, so it has no known effect on the bottom line. Callers
+    must treat that as "excluded", never as multiplier 0 (0 would silently
+    say "this row provably cancels out", which is a different, false claim).
+    """
+    if row_id not in child_to_parent:
+        return None
+    multiplier = 1
+    current = row_id
+    hops = 0
+    while current in child_to_parent:
+        row = rows_by_id[current]
+        multiplier *= row_sign_multiplier(row)
+        current = child_to_parent[current]
+        hops += 1
+        if hops > 20:
+            raise ValueError(
+                f"The aggregation chain from row #{row_id} exceeds 20 levels -- "
+                f"this sheet's sum_rows rules likely contain a cycle."
+            )
+    return multiplier
