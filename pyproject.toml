@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opencashflow"
-version = "0.6.0"
+version = "0.7.0"
 description = "Motor de proyección de flujo de caja: modelos SQLAlchemy, engine de cálculo y schemas Pydantic, agnóstico de framework web y de ledger."
 readme = "README.md"
 license = "Apache-2.0"

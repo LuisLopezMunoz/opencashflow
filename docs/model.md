@@ -244,6 +244,20 @@ la vez (la billetera y la celda, un paso atrás en su propia pila de `record_sta
 niega si algo más nuevo quedó encima o si el movimiento ya fue revertido antes — los
 movimientos son, igual que `CellActualEntry`, un log de solo-inserción.
 
+## CLI genérico (`opencashflow.cli`, `opencashflow.cli_export`)
+
+Migrado desde la app privada (2026-09-05): CRUD de planilla/sección/fila, el renderizador de
+tabla (`show`), lectura/escritura de `record`/`override`, `available`, `period close`,
+`wallet [movement]`, exportar a CSV/XLSX, y el wizard interactivo — todo lo que no depende de
+ningún concepto bancario/Chileno ni de un modelo de usuario/auth (esas partes se quedaron en
+la app consumidora). Son funciones "con forma de comando" (reciben `args`/`db`, imprimen a
+stdout) pero **este módulo todavía no arma su propio `argparse.ArgumentParser`** — hoy solo lo
+invoca la app consumidora, que sí tiene su propio `build_parser()`/`main()`. Darle a este
+módulo un punto de entrada standalone (y decidir qué hacer con el puñado de funciones que
+todavía dependen de un modelo de usuario externo, ej. `_resolve_username`) es un paso
+deliberadamente separado, más grande y más riesgoso que mover funciones ya probadas — ver
+PENDIENTES.md.
+
 ---
 
 ## Restricciones de V1
