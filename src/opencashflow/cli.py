@@ -69,6 +69,13 @@ from opencashflow.record_stack import (
     replay_record_stack as _replay_record_stack,
 )
 from opencashflow.seed import seed_sheet
+from opencashflow.sheet_spec import (
+    export_sheet_spec,
+    format_from_extension,
+    import_sheet_spec,
+    load_sheet_spec,
+    serialize_sheet_spec,
+)
 from opencashflow.wallet import Wallet, WalletMovement
 from opencashflow.wallet_movements import do_wallet_movement_add, do_wallet_movement_undo
 
@@ -1142,6 +1149,35 @@ def cmd_sheets(db, args) -> None:
         )
 
 
+
+
+def cmd_sheet_import(db, args) -> None:
+    try:
+        spec = load_sheet_spec(args.file)
+        sheet = import_sheet_spec(db, spec, user_id=args.user_id)
+    except ValueError as e:
+        # Catches both this module's own ValueErrors (duplicate row name,
+        # unresolvable reference) and pydantic.ValidationError (a
+        # ValueError subclass) from a malformed spec file.
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        f"[OK] Planilla #{sheet.id} '{sheet.name}' importada desde '{args.file}' "
+        f"({len(spec.sections)} secciones, user_id={args.user_id})."
+    )
+
+
+def cmd_sheet_export(db, args) -> None:
+    sheet = _pick_sheet(db, args.sheet_id)
+    spec = export_sheet_spec(db, sheet)
+    fmt = args.format or (format_from_extension(args.output) if args.output else "yaml")
+    text = serialize_sheet_spec(spec, fmt)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"[OK] Planilla #{sheet.id} exportada a '{args.output}'.")
+    else:
+        print(text, end="")
 
 
 def cmd_doctor(db, args) -> None:
@@ -2763,9 +2799,27 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
 
     p_sheet = sub.add_parser("sheet", help="Operaciones sobre una planilla")
     sheet_sub = p_sheet.add_subparsers(dest="sheet_command", required=True)
-    # No generic children yet -- opencashflow.sheet_spec's `import`/`export`
-    # land here once that module exists. A consuming app hangs its own
-    # `create` (or anything else) on `sheet_sub` in the meantime.
+    # A consuming app hangs its own `create` (or anything else) on
+    # sheet_sub too -- see GenericCommandExtensionPoints.
+
+    p_sheet_import = sheet_sub.add_parser(
+        "import", help="Crear una planilla completa (secciones, filas, reglas) desde un archivo YAML/JSON",
+    )
+    p_sheet_import.add_argument("--file", type=str, required=True, help="Ruta al sheet spec (.yaml/.yml/.json)")
+    p_sheet_import.add_argument("--user-id", type=int, required=True, help="Dueño de la planilla creada")
+
+    p_sheet_export = sheet_sub.add_parser(
+        "export", help="Volcar una planilla existente (secciones, filas, reglas) a un sheet spec YAML/JSON",
+    )
+    p_sheet_export.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_sheet_export.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Ruta de salida (.yaml/.yml/.json); sin esto, imprime a stdout",
+    )
+    p_sheet_export.add_argument(
+        "--format", choices=["yaml", "json"], default=None,
+        help="Default: se infiere de --output, o yaml si se imprime a stdout",
+    )
 
     p_doctor = sub.add_parser("doctor", help="Diagnosticar ciclos, reglas no soportadas y sumas incompletas")
     p_doctor.add_argument("--sheet-id", type=int, default=None)
@@ -3059,6 +3113,11 @@ def main() -> None:
             cmd_seed_standalone(db, args)
         elif args.command == "sheets":
             cmd_sheets(db, args)
+        elif args.command == "sheet":
+            if args.sheet_command == "import":
+                cmd_sheet_import(db, args)
+            elif args.sheet_command == "export":
+                cmd_sheet_export(db, args)
         elif args.command == "doctor":
             cmd_doctor(db, args)
         elif args.command == "sections":

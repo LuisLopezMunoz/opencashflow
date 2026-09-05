@@ -341,7 +341,7 @@ def export_sheet_spec(db: Session, sheet: CashflowSheet) -> SheetSpec:
 # ---------------------------------------------------------------------------
 
 
-def _format_from_extension(path: str) -> str:
+def format_from_extension(path: str) -> str:
     if path.endswith((".yaml", ".yml")):
         return "yaml"
     if path.endswith(".json"):
@@ -362,13 +362,13 @@ def serialize_sheet_spec(spec: SheetSpec, fmt: str) -> str:
 
 
 def load_sheet_spec(path: str) -> SheetSpec:
-    fmt = _format_from_extension(path)
+    fmt = format_from_extension(path)
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) if fmt == "yaml" else json.load(f)
     return SheetSpec.model_validate(raw)
 
 
 def dump_sheet_spec(spec: SheetSpec, path: str) -> None:
-    fmt = _format_from_extension(path)
+    fmt = format_from_extension(path)
     with open(path, "w", encoding="utf-8") as f:
         f.write(serialize_sheet_spec(spec, fmt))
