@@ -1,15 +1,17 @@
 ---
 name: run-opencashflow
-description: Build, test, and exercise the opencashflow library (a framework-agnostic SQLAlchemy/Pydantic cashflow-projection engine -- no server, no GUI, no CLI entry point of its own). Use when asked to install it, run its tests, verify it works after a change, or see a worked example of its write paths (override, record, period close, wallet movement).
+description: Build, test, and exercise the opencashflow library (a framework-agnostic SQLAlchemy/Pydantic cashflow-projection engine) and its standalone `opencashflow` CLI. Use when asked to install it, run its tests, verify it works after a change, try its CLI directly, or see a worked example of its write paths (override, record, period close, wallet movement).
 ---
 
-`opencashflow` is a Python **library**, not a runnable app -- there is no server to
-start and no `argparse` entry point yet (see `docs/model.md`, section "CLI genérico":
-`opencashflow.cli` exists but is library-shaped functions a *consuming* app's CLI calls
-into, not a standalone command). "Driving" it means importing it like a real consumer
-would. Do that via `.claude/skills/run-opencashflow/smoke.py` -- a runnable worked
-example (not a pytest file, no assertions-as-the-point) that seeds a sheet and walks
-every write path the library exposes, printing the result of each step.
+`opencashflow` is primarily a Python **library** (no server, no GUI), but since v0.8.1 it
+also has its own standalone CLI (`opencashflow` console script / `python -m
+opencashflow.cli`) -- a minimal, app-independent surface (no ledger, no credit cards, no
+multi-user auth) good for trying the library out or running its example specs, but not a
+substitute for a real consuming app's own richer CLI (e.g. `opencashflow-cli`'s `ocf`).
+For exercising the library's write paths as CODE (the thing a consuming app actually
+does), use `.claude/skills/run-opencashflow/smoke.py` -- a runnable worked example (not a
+pytest file, no assertions-as-the-point) that seeds a sheet and walks every write path
+the library exposes, printing the result of each step.
 
 All paths below are relative to the repo root (`~/Escritorio/opencashflow`).
 
@@ -58,6 +60,19 @@ non-zero exit / traceback means the library's public surface (`compute_sheet`,
 `_do_set_override`, `close_period`, `do_wallet_movement_add/undo`) has a real
 regression, not a flaky test.
 
+## Run the standalone CLI directly
+
+```bash
+.venv/bin/opencashflow seed --user-id 1 --months 6
+.venv/bin/opencashflow sheets
+.venv/bin/opencashflow rows --sheet-id 1
+```
+
+Defaults to a throwaway `sqlite:///./opencashflow-demo.db` in the current directory
+(override with `--db-url` or `$OPENCASHFLOW_DB_URL`) -- never a real consuming app's own
+database. This is the generic surface `register_generic_commands` builds, plus a minimal
+`seed`; it has no ledger/credit-card/auth commands (those live in a real consuming app).
+
 ## Test
 
 ```bash
@@ -65,7 +80,7 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-64 tests, all pass (confirmed this session). No known-flaky tests.
+96 tests, all pass (confirmed this session). No known-flaky tests.
 
 ## Gotchas
 

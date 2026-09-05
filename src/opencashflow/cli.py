@@ -12,16 +12,22 @@ generic command in this module and hands back the parent subparsers object
 of each command group that's split between generic and app-specific
 children (record/wallet/wallet-movement/wizard/sheet) -- a consuming app
 calls it once, then adds its own app-specific children/commands onto the
-same parser tree. This module still has no `main()`/`if __name__` of its
-own yet (a genuinely standalone entry point, so `register_generic_commands`
-is independently runnable without any consuming app, is a separate,
-deliberately sequenced next step -- see PENDIENTES.md).
+same parser tree. Since v0.8.1, this module ALSO has its own standalone
+`main()`/`if __name__` (see "Entry point" near the end of this file) --
+installed as the `opencashflow` console script -- independent of any
+consuming app: no ledger, no credit cards, no multi-user auth, just this
+module's own generic surface plus a minimal `seed`. It exists so
+`register_generic_commands` is runnable and testable on its own, and so
+the library has a copy-pasteable demo that doesn't require a consuming
+app (see docs/examples/).
 
 Any reference in these functions' own help/error text to "python -m
-backend.cli ..." is not stale: today these functions are still only reachable
-through a consuming app's own CLI entry point (e.g. opencashflow-cli's `ocf`),
-since this module has no standalone entry point of its own yet.
+backend.cli ..." refers to a CONSUMING APP's own entry point (e.g.
+opencashflow-cli's `ocf`), not this module's own standalone one (`python -m
+opencashflow.cli` / the `opencashflow` console script) -- both exist side
+by side, for different purposes.
 """
+import argparse
 import csv
 import dataclasses
 import os
@@ -33,6 +39,9 @@ from decimal import ROUND_HALF_UP, Decimal
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from opencashflow.cli_export import export_csv, export_xlsx
 from opencashflow.engine import (
     build_sum_rows_hierarchy as _build_sum_rows_hierarchy,
@@ -41,6 +50,7 @@ from opencashflow.engine import (
     row_sign_multiplier as _row_sign_multiplier,
 )
 from opencashflow.models import (
+    Base,
     CashflowSheet,
     CellActualEntry,
     CellOverride,
@@ -58,6 +68,7 @@ from opencashflow.record_stack import (
     pop_record_stack as _pop_record_stack,
     replay_record_stack as _replay_record_stack,
 )
+from opencashflow.seed import seed_sheet
 from opencashflow.wallet import Wallet, WalletMovement
 from opencashflow.wallet_movements import do_wallet_movement_add, do_wallet_movement_undo
 
@@ -2987,4 +2998,118 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+#
+# This module's OWN standalone CLI -- independent of any consuming app.
+# Exercises exactly the generic surface register_generic_commands builds,
+# plus a minimal `seed` (no User/auth model, unlike a consuming app's own
+# richer seed command). Useful for trying the engine out, running the
+# docs/examples demo, or exercising register_generic_commands end to end
+# without any consuming app -- NOT meant to replace a real app's own CLI
+# (there is no ledger, no credit cards, no bridge financing, no
+# multi-user auth here, and its default database is a throwaway sandbox
+# file, never a real app's own database).
 
+
+def _default_db_url() -> str:
+    return os.environ.get("OPENCASHFLOW_DB_URL", "sqlite:///./opencashflow-demo.db")
+
+
+def cmd_seed_standalone(db, args) -> None:
+    base_period = _parse_base_period(args.base_period) if args.base_period else date.today().replace(day=1)
+    sheet = seed_sheet(db, user_id=args.user_id, months=args.months, base_period=base_period)
+    db.commit()
+    print(
+        f"[OK] Planilla #{sheet.id} '{sheet.name}' creada para user_id={args.user_id}, "
+        f"horizonte={sheet.horizon_months} meses, base={base_period.strftime('%Y-%m')}."
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m opencashflow.cli",
+        description="CLI standalone del motor opencashflow -- superficie genérica de comandos, "
+                     "para probar la librería sin ninguna app consumidora.",
+    )
+    parser.add_argument(
+        "--db-url", type=str, default=None,
+        help="URL de SQLAlchemy (default: $OPENCASHFLOW_DB_URL, o sqlite:///./opencashflow-demo.db -- "
+             "una base descartable, nunca la base real de ninguna app consumidora)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    register_generic_commands(sub)
+
+    p_seed = sub.add_parser("seed", help="Sembrar una planilla de ejemplo (hogar chileno demo, sin ledger/auth)")
+    p_seed.add_argument("--user-id", type=int, default=1, help="Default: 1")
+    p_seed.add_argument("--months", type=int, default=12, help="Horizonte en meses (default: 12)")
+    p_seed.add_argument("--base-period", type=str, default=None, help="Mes base YYYY-MM (default: mes en curso)")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    engine = create_engine(args.db_url or _default_db_url())
+    Base.metadata.create_all(bind=engine)
+    db = sessionmaker(bind=engine)()
+
+    try:
+        if args.command == "seed":
+            cmd_seed_standalone(db, args)
+        elif args.command == "sheets":
+            cmd_sheets(db, args)
+        elif args.command == "doctor":
+            cmd_doctor(db, args)
+        elif args.command == "sections":
+            cmd_sections(db, args)
+        elif args.command == "section":
+            if args.section_command == "add":
+                cmd_section_add(db, args)
+        elif args.command == "rows":
+            cmd_rows(db, args)
+        elif args.command == "row":
+            if args.row_command == "add":
+                cmd_row_add(db, args)
+            elif args.row_command == "edit":
+                cmd_row_edit(db, args)
+        elif args.command == "backfill":
+            cmd_backfill(db, args)
+        elif args.command == "record":
+            if args.record_command == "set":
+                cmd_record_set(db, args)
+            elif args.record_command == "undo":
+                cmd_record_undo(db, args)
+            elif args.record_command == "clear":
+                cmd_record_clear(db, args)
+        elif args.command == "override":
+            if args.override_command == "set":
+                cmd_override_set(db, args)
+            elif args.override_command == "clear":
+                cmd_override_clear(db, args)
+        elif args.command == "export":
+            cmd_export(db, args)
+        elif args.command == "available":
+            cmd_available(db, args)
+        elif args.command == "period":
+            if args.period_command == "close":
+                cmd_period_close(db, args)
+        elif args.command == "wizard":
+            if args.wizard_command == "edit":
+                cmd_wizard_edit(db, args)
+        elif args.command == "wallet":
+            if args.wallet_command == "list":
+                cmd_wallet_list(db, args)
+            elif args.wallet_command == "edit":
+                cmd_wallet_edit(db, args)
+            elif args.wallet_command == "movement":
+                if args.wallet_movement_command == "add":
+                    cmd_wallet_movement_add(db, args)
+                elif args.wallet_movement_command == "undo":
+                    cmd_wallet_movement_undo(db, args)
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()

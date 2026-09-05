@@ -259,11 +259,17 @@ objeto subparsers de cada grupo que está partido entre hijos genéricos e hijos
 una app (`record`, `wallet`, `wallet movement`, `wizard`, `sheet`) — una app consumidora llama
 esta función una vez sobre su propio `parser.add_subparsers(...)` y después cuelga sus propios
 comandos (ej. `record history`, `wallet add`, `sheet create`) sobre esos mismos objetos, en vez
-de registrar todo por su cuenta. `main()` (el dispatch) sigue siendo responsabilidad de quien
-consume este módulo — `register_generic_commands` solo arma el parser, nunca despacha. Este
-módulo todavía no tiene su propio `main()`/`if __name__` (un punto de entrada genuinamente
-standalone, para poder correr `register_generic_commands` sin ninguna app consumidora) — ver
-PENDIENTES.md para ese paso, deliberadamente separado.
+de registrar todo por su cuenta.
+
+Desde v0.8.1, este módulo TAMBIÉN tiene su propio `main()`/`if __name__` standalone,
+instalado como el script de consola `opencashflow` (`opencashflow seed`, `opencashflow
+show`, etc., o `python -m opencashflow.cli`) — independiente de cualquier app consumidora:
+sin ledger, sin tarjetas de crédito, sin auth multiusuario, solo la superficie genérica de
+este módulo más un `seed` mínimo propio. Existe para que `register_generic_commands` sea
+ejecutable y probable por sí solo, y para que la librería tenga un demo copy-pasteable sin
+depender de ninguna app real. Una app consumidora sigue armando su propio `main()`/dispatch
+como siempre — `register_generic_commands` nunca despacha, solo arma el parser; el `main()`
+de este módulo es una alternativa standalone, no un reemplazo del de la app.
 
 ---
 
