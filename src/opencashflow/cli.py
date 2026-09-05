@@ -6,11 +6,16 @@ Migrated out of the private opencashflow-app's backend/cli.py (2026-09-05):
 every function here was verified to depend on nothing but opencashflow.* --
 no Chilean bank/credit-card/bicicleta content, no private ledger/auth model.
 These are library-shaped command handlers (they take `args`/`db` and print
-to stdout, never `sys.exit` except where noted) -- a consuming app's own
-CLI wires up argparse and calls into these; this module does not build its
-own ArgumentParser (see PENDIENTES.md for that as a separate, deliberately
-sequenced next step -- splitting the parser/dispatch skeleton is a bigger,
-riskier change than moving already-working functions verbatim).
+to stdout, never `sys.exit` except where noted). `register_generic_commands`
+(near the end of this file) builds the argparse subparser tree for every
+generic command in this module and hands back the parent subparsers object
+of each command group that's split between generic and app-specific
+children (record/wallet/wallet-movement/wizard/sheet) -- a consuming app
+calls it once, then adds its own app-specific children/commands onto the
+same parser tree. This module still has no `main()`/`if __name__` of its
+own yet (a genuinely standalone entry point, so `register_generic_commands`
+is independently runnable without any consuming app, is a separate,
+deliberately sequenced next step -- see PENDIENTES.md).
 
 Any reference in these functions' own help/error text to "python -m
 backend.cli ..." is not stale: today these functions are still only reachable
@@ -2699,6 +2704,284 @@ def cmd_wizard_edit(db, args) -> None:
             break
         else:
             print("Opción inválida.")
+
+
+# ---------------------------------------------------------------------------
+# Generic CLI parser registration
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class GenericCommandExtensionPoints:
+    """Sub-subparser objects for the FIVE command groups that are split
+    between this module's generic commands and a consuming app's own
+    app-specific ones (e.g. anything coupled to a private `User`/auth
+    model). register_generic_commands creates each of these groups'
+    parent parser and registers only its generic children, then hands
+    back the group's own argparse subparsers object so the consuming app
+    can call .add_parser(...) on it directly to add its remaining,
+    app-specific children -- record/history, wallet/add,
+    wallet-movement/list, wizard/new, and sheet/create (plus whatever
+    else an app wants to hang under these same groups) all get wired
+    this way, onto the SAME parent group, rather than as unrelated
+    top-level commands."""
+
+    record_sub: Any
+    wallet_sub: Any
+    wallet_movement_sub: Any
+    wizard_sub: Any
+    sheet_sub: Any
+
+
+def register_generic_commands(sub) -> GenericCommandExtensionPoints:
+    """Register every fully-generic sheet-engine subcommand onto `sub` (an
+    argparse subparsers object, from `parser.add_subparsers(...)`), and
+    return the parent subparsers objects of the five command groups that
+    are split between generic and app-specific children (see
+    GenericCommandExtensionPoints) so a consuming app can add its own
+    children onto the SAME groups instead of registering unrelated
+    top-level commands.
+
+    This function only builds the parser tree -- it never dispatches.
+    main()'s if/elif chain (in whichever module owns it) already calls
+    the right handler regardless of where that handler's add_parser(...)
+    call lives, since args.command/args.<x>_command are plain strings
+    either way.
+    """
+    sub.add_parser("sheets", help="Listar las planillas existentes")
+
+    p_sheet = sub.add_parser("sheet", help="Operaciones sobre una planilla")
+    sheet_sub = p_sheet.add_subparsers(dest="sheet_command", required=True)
+    # No generic children yet -- opencashflow.sheet_spec's `import`/`export`
+    # land here once that module exists. A consuming app hangs its own
+    # `create` (or anything else) on `sheet_sub` in the meantime.
+
+    p_doctor = sub.add_parser("doctor", help="Diagnosticar ciclos, reglas no soportadas y sumas incompletas")
+    p_doctor.add_argument("--sheet-id", type=int, default=None)
+
+    p_sections = sub.add_parser("sections", help="Listar las secciones de una planilla")
+    p_sections.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+
+    p_section = sub.add_parser("section", help="Operaciones sobre las secciones de una planilla")
+    section_sub = p_section.add_subparsers(dest="section_command", required=True)
+
+    p_section_add = section_sub.add_parser("add", help="Agregar una sección a una planilla")
+    p_section_add.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_section_add.add_argument("--name", type=str, required=True)
+    p_section_add.add_argument("--type", dest="type", choices=["income", "expense", "financing", "balance", "custom"],
+                                default="custom", help="Default: custom")
+    p_section_add.add_argument("--sort-order", type=int, default=None,
+                                help="Default: uno más que el orden máximo actual de la planilla (al final)")
+
+    p_rows = sub.add_parser("rows", help="Listar las filas de una planilla (opcionalmente filtradas por sección)")
+    p_rows.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_rows.add_argument("--section", type=str, default=None, help="Nombre (o parte) o id de la sección para filtrar")
+
+    p_row = sub.add_parser("row", help="Operaciones sobre las filas de una planilla")
+    row_sub = p_row.add_subparsers(dest="row_command", required=True)
+
+    p_row_add = row_sub.add_parser("add", help="Agregar una fila a una sección")
+    p_row_add.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_row_add.add_argument("--section", type=str, required=True, help="Nombre (o parte) o id de la sección")
+    p_row_add.add_argument("--name", type=str, required=True)
+    p_row_add.add_argument("--row-type", choices=_ROW_TYPE_CHOICES, default="input", help="Default: input")
+    p_row_add.add_argument("--sign", choices=["positive", "negative"], default="positive", help="Default: positive")
+    p_row_add.add_argument("--sort-order", type=int, default=None,
+                            help="Default: uno más que el orden máximo actual de la sección (al final)")
+    _add_rule_args(p_row_add)
+
+    p_row_edit = row_sub.add_parser("edit", help="Editar una fila existente (actualización parcial)")
+    p_row_edit.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_row_edit.add_argument("--row", type=str, required=True, help="Nombre (o parte) o id de la fila")
+    p_row_edit.add_argument("--name", type=str, default=None)
+    p_row_edit.add_argument("--row-type", choices=_ROW_TYPE_CHOICES, default=None)
+    p_row_edit.add_argument("--sign", choices=["positive", "negative"], default=None)
+    p_row_edit.add_argument("--sort-order", type=int, default=None,
+                             help="Orden de despliegue dentro de la sección (más chico = más arriba)")
+    p_row_edit.add_argument("--clear-rule", action="store_true", help="Quita la regla de la fila (sin --rule-type)")
+    _add_rule_args(p_row_edit)
+
+    p_backfill = sub.add_parser(
+        "backfill", help="Agregar períodos históricos antes del primer período existente de la planilla",
+    )
+    p_backfill.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_backfill.add_argument("--months", type=int, required=True, help="Cuántos meses históricos agregar hacia atrás")
+
+    # "record" is split: set/undo/clear are generic (registered here);
+    # "history" is app-specific (resolves created_by to a username via a
+    # private User-model query) -- a consuming app adds it onto record_sub.
+    p_record = sub.add_parser("record", help="Operaciones sobre el valor real (actual/accrued/paid) de una celda")
+    record_sub = p_record.add_subparsers(dest="record_command", required=True)
+
+    p_record_set = record_sub.add_parser("set", help="Registrar el valor real (actual/accrued/paid) de una celda")
+    p_record_set.add_argument("--row", type=str, required=True, help="Nombre (o parte del nombre) o row_id de la fila")
+    p_record_set.add_argument("--actual", type=str, default=None, help="Monto efectivamente gastado/cobrado")
+    p_record_set.add_argument("--accrued", type=str, default=None, help="Monto devengado/causado")
+    p_record_set.add_argument("--paid", type=str, default=None, help="Monto efectivamente pagado")
+    p_record_set.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (default: mes en curso)")
+    p_record_set.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_record_set.add_argument("--user-id", type=int, default=None, help="Default: el dueño de la planilla")
+    p_record_set.add_argument("--note", type=str, default=None)
+    p_record_set.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
+
+    p_record_undo = record_sub.add_parser(
+        "undo", help="Deshacer el último record de una celda (vuelve al valor anterior, o a sin valor si era el primero)",
+    )
+    p_record_undo.add_argument("--row", type=str, required=True, help="Nombre (o parte del nombre) o row_id de la fila")
+    p_record_undo.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (default: mes en curso)")
+    p_record_undo.add_argument("--sheet-id", type=int, default=None,
+                                help="Default: la planilla creada más recientemente")
+    p_record_undo.add_argument("--user-id", type=int, default=None, help="Default: el dueño de la planilla")
+    p_record_undo.add_argument("--note", type=str, default=None)
+    p_record_undo.add_argument("--unit", choices=["k", "1"], default="1",
+                                help="1 = pesos completos (default), k = miles")
+
+    p_record_clear = record_sub.add_parser(
+        "clear", help="Limpiar el valor real (actual/accrued/paid) de una o más celdas -- vuelve a sin valor registrado",
+    )
+    p_record_clear.add_argument("--row", type=str, required=True, help="Nombre (o parte del nombre) o row_id de la fila")
+    p_record_clear.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (excluyente con --from/--to-period)")
+    p_record_clear.add_argument("--from-period", type=str, default=None, help="Mes YYYY-MM inicial del rango")
+    p_record_clear.add_argument("--to-period", type=str, default=None, help="Mes YYYY-MM final del rango (inclusive)")
+    p_record_clear.add_argument("--sheet-id", type=int, default=None,
+                                 help="Default: la planilla creada más recientemente")
+    p_record_clear.add_argument("--user-id", type=int, default=None, help="Default: el dueño de la planilla")
+    p_record_clear.add_argument("--note", type=str, default=None)
+    p_record_clear.add_argument("--unit", choices=["k", "1"], default="1",
+                                 help="1 = pesos completos (default), k = miles")
+
+    p_override = sub.add_parser("override", help="Operaciones sobre overrides manuales de celdas")
+    override_sub = p_override.add_subparsers(dest="override_command", required=True)
+
+    p_override_set = override_sub.add_parser(
+        "set", help="Escribir un override manual (valor, regla o lock) en una o más celdas de una fila",
+    )
+    p_override_set.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_override_set.add_argument("--row", type=str, required=True, help="Nombre (o parte) o id de la fila")
+    p_override_set.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (excluyente con --from/--to-period)")
+    p_override_set.add_argument("--from-period", type=str, default=None, help="Mes YYYY-MM inicial del rango")
+    p_override_set.add_argument("--to-period", type=str, default=None, help="Mes YYYY-MM final del rango (inclusive)")
+    p_override_set.add_argument("--value", type=str, default=None, help="Override de valor manual constante")
+    p_override_set.add_argument(
+        "--lock", action="store_true",
+        help="Congela el valor efectivo ACTUAL de la celda (se captura antes de escribir, nunca queda en None)",
+    )
+    p_override_set.add_argument("--note", type=str, default=None)
+    p_override_set.add_argument("--user-id", type=int, default=None, help="Default: el dueño de la planilla")
+    _add_rule_args(p_override_set)
+
+    p_override_clear = override_sub.add_parser(
+        "clear", help="Limpiar el override activo de una o más celdas de una fila (vuelve a su regla)",
+    )
+    p_override_clear.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_override_clear.add_argument("--row", type=str, required=True, help="Nombre (o parte) o id de la fila")
+    p_override_clear.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (excluyente con --from/--to-period)")
+    p_override_clear.add_argument("--from-period", type=str, default=None, help="Mes YYYY-MM inicial del rango")
+    p_override_clear.add_argument("--to-period", type=str, default=None, help="Mes YYYY-MM final del rango (inclusive)")
+
+    p_export = sub.add_parser("export", help="Exportar la planilla calculada a un archivo CSV o Excel")
+    p_export.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_export.add_argument("--months", type=int, default=None,
+                           help="Períodos proyectados a exportar después del actual (default: todo el rango; "
+                                "si se da junto con --before/--context, ancla la ventana en el período actual)")
+    p_export.add_argument("--before", type=int, default=None, help="Cuántos períodos históricos exportar antes del actual")
+    p_export.add_argument("--context", type=int, default=None,
+                           help="Atajo para --before N --months N a la vez (estilo grep -C)")
+    p_export.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
+    p_export.add_argument("--format", choices=["csv", "xlsx"], default="csv")
+    p_export.add_argument("--mode", choices=["values", "formulas"], default="values",
+                           help="formulas solo con --format xlsx: traduce las reglas a fórmulas de Excel vivas")
+    p_export.add_argument("--styled", action="store_true", help="Encabezados/subtotales en negrita (solo xlsx)")
+    p_export.add_argument("--show-ids", action="store_true", help="Prefijar cada fila con su row_id")
+    p_export.add_argument("-o", "--output", type=str, default=None, help="Ruta de salida (default: nombre autogenerado)")
+
+    p_available = sub.add_parser(
+        "available",
+        help="Cuánto hay disponible para gastar ahora mismo (saldo inicial, más lo ya pagado en efectivo, menos lo facturado y aún sin pagar)",
+    )
+    p_available.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_available.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
+
+    p_period = sub.add_parser("period", help="Operaciones sobre períodos de una planilla")
+    period_sub = p_period.add_subparsers(dest="period_command", required=True)
+
+    p_period_close = period_sub.add_parser(
+        "close",
+        help="Cerrar un período: congela el saldo final real y arrastra lo pendiente al siguiente",
+    )
+    p_period_close.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_period_close.add_argument("--period", type=str, required=True, help="Mes YYYY-MM a cerrar")
+    p_period_close.add_argument("--dry-run", action="store_true", help="Muestra qué pasaría, sin escribir nada")
+    p_period_close.add_argument(
+        "--balance-row", type=str, default=None,
+        help="Nombre (o parte) o row_id de la fila de saldo inicial (solo necesario si la auto-detección es ambigua)",
+    )
+    p_period_close.add_argument(
+        "--assume-unrecorded-as-pending", action="store_true",
+        help="Filas con proyección pero sin ningún dato real: asumirlas 100%% pendientes en vez de advertir y omitirlas",
+    )
+    p_period_close.add_argument("--user-id", type=int, default=None, help="Default: el dueño de la planilla")
+
+    # "wizard" is split: edit is generic (registered here); "new" is
+    # app-specific (creates a sheet owned by a private User) -- a
+    # consuming app adds it onto wizard_sub.
+    p_wizard = sub.add_parser(
+        "wizard", help="Asistente interactivo paso a paso para crear o editar una planilla",
+    )
+    wizard_sub = p_wizard.add_subparsers(dest="wizard_command", required=True)
+
+    p_wizard_edit = wizard_sub.add_parser("edit", help="Editar una planilla existente con un menú interactivo")
+    p_wizard_edit.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+
+    # "wallet" is split: list/edit are generic (registered here); "add" is
+    # app-specific (creates a wallet owned by a private User) -- a
+    # consuming app adds it onto wallet_sub. Likewise "wallet movement":
+    # add/undo are generic, "list" is app-specific.
+    p_wallet = sub.add_parser("wallet", help="Operaciones sobre billeteras (cuentas bancarias, efectivo, etc.)")
+    wallet_sub = p_wallet.add_subparsers(dest="wallet_command", required=True)
+
+    p_wallet_list = wallet_sub.add_parser("list", help="Listar billeteras")
+    p_wallet_list.add_argument("--user-id", type=int, default=None, help="Filtrar por dueño (default: todas)")
+
+    p_wallet_edit = wallet_sub.add_parser("edit", help="Editar una billetera existente (actualización parcial)")
+    p_wallet_edit.add_argument("--wallet", type=str, required=True, help="Nombre (o parte) o id de la billetera")
+    p_wallet_edit.add_argument("--name", type=str, default=None)
+    p_wallet_edit.add_argument("--type", type=str, default=None)
+    p_wallet_edit.add_argument("--currency", type=str, default=None)
+    p_wallet_edit.add_argument("--balance", type=float, default=None)
+    p_wallet_edit.add_argument("--description", type=str, default=None)
+
+    p_wallet_movement = wallet_sub.add_parser(
+        "movement", help="Un movimiento real que abona/descuenta una billetera Y registra una fila como real a la vez",
+    )
+    wallet_movement_sub = p_wallet_movement.add_subparsers(dest="wallet_movement_command", required=True)
+
+    p_wm_add = wallet_movement_sub.add_parser(
+        "add", help="Registrar un movimiento (ej. un sueldo abonado, una cuenta pagada desde la billetera)",
+    )
+    p_wm_add.add_argument("--wallet", type=str, required=True, help="Nombre (o parte) o id de la billetera")
+    p_wm_add.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_wm_add.add_argument("--row", type=str, required=True, help="Nombre (o parte) o id de la fila afectada")
+    p_wm_add.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (default: mes en curso)")
+    p_wm_add.add_argument(
+        "--amount", type=float, required=True,
+        help="Monto POSITIVO -- el signo con que afecta a la billetera lo decide la fila (ingreso suma, gasto resta)",
+    )
+    p_wm_add.add_argument("--note", type=str, default=None)
+    p_wm_add.add_argument("--user-id", type=int, default=None)
+
+    p_wm_undo = wallet_movement_sub.add_parser("undo", help="Deshacer un movimiento (revierte billetera Y celda)")
+    p_wm_undo.add_argument("--movement-id", type=int, required=True)
+    p_wm_undo.add_argument("--note", type=str, default=None)
+    p_wm_undo.add_argument("--user-id", type=int, default=None)
+
+    return GenericCommandExtensionPoints(
+        record_sub=record_sub,
+        wallet_sub=wallet_sub,
+        wallet_movement_sub=wallet_movement_sub,
+        wizard_sub=wizard_sub,
+        sheet_sub=sheet_sub,
+    )
 
 
 # ---------------------------------------------------------------------------

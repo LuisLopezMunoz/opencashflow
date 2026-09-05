@@ -251,12 +251,19 @@ tabla (`show`), lectura/escritura de `record`/`override`, `available`, `period c
 `wallet [movement]`, exportar a CSV/XLSX, y el wizard interactivo — todo lo que no depende de
 ningún concepto bancario/Chileno ni de un modelo de usuario/auth (esas partes se quedaron en
 la app consumidora). Son funciones "con forma de comando" (reciben `args`/`db`, imprimen a
-stdout) pero **este módulo todavía no arma su propio `argparse.ArgumentParser`** — hoy solo lo
-invoca la app consumidora, que sí tiene su propio `build_parser()`/`main()`. Darle a este
-módulo un punto de entrada standalone (y decidir qué hacer con el puñado de funciones que
-todavía dependen de un modelo de usuario externo, ej. `_resolve_username`) es un paso
-deliberadamente separado, más grande y más riesgoso que mover funciones ya probadas — ver
-PENDIENTES.md.
+stdout).
+
+Desde v0.8.0, `register_generic_commands(sub)` arma el árbol de subparsers de argparse para
+TODOS los comandos genéricos de este módulo, y devuelve (`GenericCommandExtensionPoints`) el
+objeto subparsers de cada grupo que está partido entre hijos genéricos e hijos específicos de
+una app (`record`, `wallet`, `wallet movement`, `wizard`, `sheet`) — una app consumidora llama
+esta función una vez sobre su propio `parser.add_subparsers(...)` y después cuelga sus propios
+comandos (ej. `record history`, `wallet add`, `sheet create`) sobre esos mismos objetos, en vez
+de registrar todo por su cuenta. `main()` (el dispatch) sigue siendo responsabilidad de quien
+consume este módulo — `register_generic_commands` solo arma el parser, nunca despacha. Este
+módulo todavía no tiene su propio `main()`/`if __name__` (un punto de entrada genuinamente
+standalone, para poder correr `register_generic_commands` sin ninguna app consumidora) — ver
+PENDIENTES.md para ese paso, deliberadamente separado.
 
 ---
 
