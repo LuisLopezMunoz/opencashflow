@@ -2017,7 +2017,7 @@ def cmd_wallet_list(db, args) -> None:
         desc = f"  ({w.description})" if w.description else ""
         print(
             f"[{w.id}] {w.name}  tipo={w.wallet_type}  "
-            f"saldo={_fmt_number(Decimal(str(w.balance)), '1')} {w.currency}  "
+            f"saldo={_fmt_number(w.balance, '1')} {w.currency}  "
             f"usuario_id={w.user_id}{desc}"
         )
 
@@ -2058,7 +2058,7 @@ def cmd_wallet_edit(db, args) -> None:
     if args.currency is not None:
         kwargs["currency"] = args.currency.upper()
     if args.balance is not None:
-        kwargs["balance"] = args.balance
+        kwargs["balance"] = Decimal(str(args.balance))
     if args.description is not None:
         kwargs["description"] = args.description
 
@@ -2111,9 +2111,9 @@ def cmd_wallet_movement_add(db, args) -> None:
     sign_text = "+" if m.amount >= 0 else "-"
     print(
         f"[OK] Movimiento #{m.id} en billetera [{wallet.id}] {wallet.name}: "
-        f"{sign_text}{_fmt_number(Decimal(str(abs(m.amount))), '1')} {wallet.currency}  "
-        f"(saldo {_fmt_number(Decimal(str(result.wallet_balance_before)), '1')} -> "
-        f"{_fmt_number(Decimal(str(result.wallet_balance_after)), '1')})"
+        f"{sign_text}{_fmt_number(abs(m.amount), '1')} {wallet.currency}  "
+        f"(saldo {_fmt_number(result.wallet_balance_before, '1')} -> "
+        f"{_fmt_number(result.wallet_balance_after, '1')})"
     )
     before_text = _fmt_number(result.cell_paid_before, "1") if result.cell_paid_before is not None else "—"
     print(
@@ -2140,8 +2140,8 @@ def cmd_wallet_movement_undo(db, args) -> None:
 
     print(
         f"[OK] Se deshizo el movimiento #{movement.id} (billetera [{wallet.id}] {wallet.name}): "
-        f"saldo {_fmt_number(Decimal(str(result.wallet_balance_before)), '1')} -> "
-        f"{_fmt_number(Decimal(str(result.wallet_balance_after)), '1')}  "
+        f"saldo {_fmt_number(result.wallet_balance_before, '1')} -> "
+        f"{_fmt_number(result.wallet_balance_after, '1')}  "
         f"(reversión registrada como movimiento #{result.reversal.id})"
     )
 
@@ -2157,7 +2157,7 @@ def _wallets_summary(db, user_id: int) -> List[Tuple[str, Decimal, List[Wallet]]
     for w in wallets:
         by_currency.setdefault(w.currency, []).append(w)
     return [
-        (currency, sum((Decimal(str(w.balance)) for w in group), Decimal(0)), group)
+        (currency, sum((w.balance for w in group), Decimal(0)), group)
         for currency, group in by_currency.items()
     ]
 
@@ -2186,7 +2186,7 @@ def _print_wallets_section(db, user_id: int, unit: str) -> None:
         print(f"  Total {currency}: {_fmt_number(total, unit)}")
         for w in wallets:
             desc = f"  ({w.description})" if w.description else ""
-            print(f"    [{w.id}] {w.name} ({w.wallet_type}): {_fmt_number(Decimal(str(w.balance)), unit)}{desc}")
+            print(f"    [{w.id}] {w.name} ({w.wallet_type}): {_fmt_number(w.balance, unit)}{desc}")
     print()
 
 
@@ -3013,7 +3013,7 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
     p_wallet_edit.add_argument("--name", type=str, default=None)
     p_wallet_edit.add_argument("--type", type=str, default=None)
     p_wallet_edit.add_argument("--currency", type=str, default=None)
-    p_wallet_edit.add_argument("--balance", type=float, default=None)
+    p_wallet_edit.add_argument("--balance", type=str, default=None)
     p_wallet_edit.add_argument("--description", type=str, default=None)
 
     p_wallet_movement = wallet_sub.add_parser(
@@ -3029,7 +3029,7 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
     p_wm_add.add_argument("--row", type=str, required=True, help="Nombre (o parte) o id de la fila afectada")
     p_wm_add.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (default: mes en curso)")
     p_wm_add.add_argument(
-        "--amount", type=float, required=True,
+        "--amount", type=str, required=True,
         help="Monto POSITIVO -- el signo con que afecta a la billetera lo decide la fila (ingreso suma, gasto resta)",
     )
     p_wm_add.add_argument("--note", type=str, default=None)
