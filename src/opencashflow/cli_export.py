@@ -260,8 +260,11 @@ def export_xlsx(
 
                 value, comment = _cell_content(
                     cell_result, row, period.id, active_ov,
-                    row_id_to_excel_row, period_id_to_col_letter, sorted_period_ids, row_signs, mode,
+                    row_id_to_excel_row, period_id_to_col_letter, sorted_period_ids, row_signs, "values" if result.get("forecast_anchor_id") is not None else mode,
                 )
+
+                if mode == "formulas" and result.get("forecast_anchor_id") is not None:
+                    comment = "Instantánea desde Actual: valor calculado; mantiene las bases mensuales completas de las reglas."
 
                 xcell = ws.cell(row=excel_row, column=col_idx)
                 if isinstance(value, str) and value.startswith("="):

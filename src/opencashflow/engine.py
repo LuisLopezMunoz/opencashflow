@@ -344,8 +344,11 @@ def _evaluate_rule(
     return None, EffectiveSource.EMPTY, f"unsupported_rule:{rule_type}"
 
 
-def compute_sheet(sheet_id: int, db: Session) -> Dict:
+def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[Tuple[int, int], Optional[Decimal]]] = None) -> Dict:
     """Compute all cell values for a sheet and return the result dict.
+
+    value_overrides supplies ephemeral scenario values keyed by (row_id, period_id).
+    They propagate through dependent rules without writing cells or audit entries.
 
     Returns a dict with structure:
     {
@@ -436,6 +439,10 @@ def compute_sheet(sheet_id: int, db: Session) -> Dict:
     for row in all_rows:
         for period in periods:
             key = (row.id, period.id)
+            if value_overrides is not None and key in value_overrides:
+                effective_manual[key] = value_overrides[key]
+                effective_rules[key] = None
+                continue
             cell = cell_map.get(key)
             if cell is not None:
                 active_ov = _get_active_override(cell.overrides)

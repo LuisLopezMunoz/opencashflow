@@ -642,30 +642,33 @@ def _render_table(
                 else:
                     cell_texts.append((_fmt_number(cell.projected_value, unit), cell.effective_source == "manual"))
             real_text = _fmt_number(real_values.get(row.id), unit) if show_real else None
-            # Solo en la fila de saldo, y solo cuando hay algo que sumarle:
-            # "223.253 (387.721)" -- caja sola, y entre paréntesis el total
-            # si además contamos el cupo de tarjetas disponible ahora
-            # (billeteras + crédito, ver _wallets_total_for_currency/
-            # _credit_total_for_currency en cmd_show). Deliberadamente
-            # aparte de lo que real_values ya trae: ESE número sigue
-            # alimentando SALDO FINAL/FLUJO NETO más abajo en la tabla
-            # (por eso solo suma el cupo YA retirado por el bridge, ver
-            # _compute_real_column_values) -- este paréntesis es puramente
-            # informativo, "esto es lo que también podrías usar", y nunca
-            # se mezcla con esa cuenta.
-            if real_text is not None and row.id == balance_row_id and combined_total is not None:
-                real_text = f"{real_text} ({_fmt_number(combined_total, unit)})"
-            resolved_rows.append((section, row, cell_texts, real_text))
+            # Solo en la fila de saldo, y solo cuando hay algo que sumarle: el
+            # total con cupo de tarjetas incluido (billeteras + crédito, ver
+            # _wallets_total_for_currency/_credit_total_for_currency en
+            # cmd_show) se imprime aparte, en una segunda línea bajo la misma
+            # columna -- nunca pegado a real_text, o su ancho combinado termina
+            # ensanchando col_width y por lo tanto TODAS las columnas de la
+            # tabla (ver el print de la fila más abajo). Deliberadamente aparte
+            # de lo que real_values ya trae: ESE número sigue alimentando
+            # SALDO FINAL/FLUJO NETO más abajo en la tabla (por eso solo suma
+            # el cupo YA retirado por el bridge, ver _compute_real_column_values)
+            # -- este paréntesis es puramente informativo, "esto es lo que
+            # también podrías usar", y nunca se mezcla con esa cuenta.
+            paren_text = None
+            if row.id == balance_row_id and combined_total is not None and show_real:
+                paren_text = f"({_fmt_number(combined_total, unit)})"
+            resolved_rows.append((section, row, cell_texts, real_text, paren_text))
 
     max_len = max([len(header_label(p)) for p in periods], default=8)
     if show_real and real_label:
         max_len = max(max_len, len(real_label))
-    for _section, _row, cell_texts, real_text in resolved_rows:
+    for _section, _row, cell_texts, real_text, _paren_text in resolved_rows:
         for text, marked in cell_texts:
             max_len = max(max_len, len(text) + (1 if marked else 0))
         if real_text is not None:
             max_len = max(max_len, len(real_text))
     col_width = max(8, max_len)
+    real_width = max(col_width, max((len(pt) for *_, pt in resolved_rows if pt), default=0))
 
     # Ancho de la columna de nombres: dinámico, no un número fijo -- un
     # nombre de fila (con su prefijo "(−) "/"    ", 4 caracteres siempre)
@@ -676,15 +679,15 @@ def _render_table(
     # nombres cortos.
     label_width = max(
         28,
-        max((len(f"    {r.name}") for _s, r, _c, _rt in resolved_rows), default=0),
-        max((len(f"    [{r.id}] {r.name}") for _s, r, _c, _rt in resolved_rows), default=0) if show_ids else 0,
+        max((len(f"    {r.name}") for _s, r, _c, _rt, _pt in resolved_rows), default=0),
+        max((len(f"    [{r.id}] {r.name}") for _s, r, _c, _rt, _pt in resolved_rows), default=0) if show_ids else 0,
     )
 
     unit_label = "cifras en M$" if unit == "k" else "cifras en pesos"
     print(f"{sheet.name} — planilla #{sheet.id} — {sheet.currency} — {unit_label}\n")
 
     extra_cols = 1 if show_real else 0
-    total_width = label_width + (len(periods) + extra_cols) * (col_width + 1)
+    total_width = label_width + len(periods) * (col_width + 1) + extra_cols * (real_width + 1)
     if total_width > term_width:
         print(
             f"[aviso] la tabla necesita ~{total_width} columnas y el terminal tiene {term_width}. "
@@ -702,8 +705,8 @@ def _render_table(
         header_line1 += f"{header_label(p):>{col_width + 1}}"
         header_line2 += " " * (col_width + 1)  # en blanco bajo la columna propia del período
         if show_real and p.id == anchor_period_id:
-            header_line1 += " " * (col_width + 1)  # en blanco bajo la columna extra, línea 1
-            header_line2 += f"{real_label:>{col_width + 1}}"  # "Actual" bajo la columna extra, línea 2
+            header_line1 += " " * (real_width + 1)  # en blanco bajo la columna extra, línea 1
+            header_line2 += f"{real_label:>{real_width + 1}}"  # "Actual" bajo la columna extra, línea 2
     print(header_line1)
     if show_real:
         print(header_line2)
@@ -711,7 +714,7 @@ def _render_table(
     used_manual = False
     used_error = False
     current_section = None
-    for section, row, cell_texts, real_text in resolved_rows:
+    for section, row, cell_texts, real_text, paren_text in resolved_rows:
         if section is not current_section:
             current_section = section
             if section.section_type != "balance":
@@ -721,7 +724,8 @@ def _render_table(
         name_display = f"[{row.id}] {row.name}" if show_ids else row.name
         label = f"{prefix}{name_display}"
         line = f"{label:<{label_width}}"
-        for p, (text, marked) in zip(periods, cell_texts):
+        real_col_offset = None
+        for idx, (p, (text, marked)) in enumerate(zip(periods, cell_texts)):
             if marked:
                 used_manual = True
             if text in ("!ciclo", "!regla"):
@@ -741,7 +745,12 @@ def _render_table(
             else:
                 line += padded
             if show_real and p.id == anchor_period_id:
-                padded_real = f"{real_text:>{col_width + 1}}"
+                # Offset calculado, no leído de len(line) -- line ya puede
+                # traer códigos ANSI de columnas anteriores, que cuentan como
+                # caracteres visibles y correrían la segunda línea (ver nota
+                # de arriba sobre por qué el color se aplica al final).
+                real_col_offset = label_width + (idx + 1) * (col_width + 1)
+                padded_real = f"{real_text:>{real_width + 1}}"
                 if real_text.startswith("-"):
                     line += _c(padded_real, "red")
                 elif is_expense:
@@ -749,6 +758,8 @@ def _render_table(
                 else:
                     line += padded_real
         print(line)
+        if paren_text is not None and real_col_offset is not None:
+            print(" " * real_col_offset + f"{paren_text:>{real_width + 1}}")
 
     legend = []
     if anchor_period_id is not None and any(p.id == anchor_period_id for p in periods):
@@ -760,10 +771,9 @@ def _render_table(
         legend.append("! = error de cálculo")
     if show_real:
         legend.append(
-            f"{real_label} = actualizado con lo real: SALDO INICIAL pasa a ser caja + cupo real de las "
-            f"tarjetas del bridge de este período (ver detalle abajo) -- sin reservar lo facturado y aún sin "
-            f"pagar como sí hace `available`; cada otra fila muestra lo que falta por resolver (facturado y aún "
-            f"sin pagar, o el monto proyectado completo si todavía no hay ningún record)"
+            f"{real_label} = actualizado con lo real: SALDO INICIAL usa la base detallada abajo; "
+            f"cada otra fila muestra lo pendiente por cobrar o pagar. Los meses futuros "
+            f"arrastran el cierre actualizado cuando se usa la proyección desde Actual."
         )
     print("\n  " + "    ".join(legend))
 
@@ -1723,7 +1733,7 @@ def cmd_override_clear(db, args) -> None:
 
 
 
-def cmd_export(db, args) -> None:
+def cmd_export(db, args, *, result=None) -> None:
     if args.mode == "formulas" and args.format == "csv":
         print("--mode formulas solo es válido con --format xlsx.", file=sys.stderr)
         sys.exit(1)
@@ -1732,7 +1742,8 @@ def cmd_export(db, args) -> None:
         sys.exit(1)
 
     sheet = _pick_sheet(db, args.sheet_id)
-    result = compute_sheet(sheet.id, db)
+    if result is None:
+        result = compute_sheet(sheet.id, db)
     all_periods = result["periods"]
     if not all_periods:
         print(f"La planilla #{sheet.id} no tiene períodos.", file=sys.stderr)
