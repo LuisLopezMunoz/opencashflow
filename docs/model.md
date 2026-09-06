@@ -304,6 +304,19 @@ ESTRUCTURA de una planilla (secciones, filas, reglas), nunca overrides manuales 
 celda ni valores reales (`actual`/`accrued`/`paid`), que quedan fuera de este formato a
 propósito: un sheet spec versiona la FORMA de una planilla, no sus datos.
 
+## `value_overrides` (`opencashflow.engine.compute_sheet`)
+
+Desde v0.10.0: `compute_sheet(sheet_id, db, value_overrides={(row_id, period_id): valor, ...})`
+acepta valores de escenario EFÍMEROS, uno por celda — se comportan exactamente como un
+override real `manual_value` para efectos de qué valor usa esa celda y todo lo que
+dependa de ella (`previous_period`, `sum_rows`, etc.), pero nunca se escribe nada en la
+base: ni `SheetCell`, ni `CellOverride`. Gana siempre, incluso sobre un override real
+`manual_value` ya guardado en esa celda. Pensado para que una app consumidora responda
+"¿qué pasaría si el cierre de este mes fuera X?" sin comprometerse a nada — ver
+`opencashflow-cli/backend/forecast.py` para un uso real: reemplaza el saldo de cierre del
+período actual por su valor real (calculado aparte) y deja que se propague hacia adelante
+por la cadena `previous_period`, sin tocar ninguna otra regla ya guardada.
+
 ---
 
 ## Restricciones de V1

@@ -661,3 +661,79 @@ def test_lock_override_with_no_captured_value_resolves_to_none(db):
     result = _cells_for(matrix, row.id)[0]
     assert result.projected_value is None
     assert result.effective_source == "manual"
+
+
+# ---------------------------------------------------------------------------
+# value_overrides: ephemeral scenario values keyed by (row_id, period_id),
+# used by a consuming app to ask "what if this cell were X" -- propagates
+# through dependent rules (previous_period, sum_rows, ...) exactly like a
+# real manual_value override would, but never touches the database.
+# ---------------------------------------------------------------------------
+
+def test_value_override_propagates_through_previous_period_chain(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=3)
+    section = _make_section(db, sheet)
+
+    opening = SheetRow(section_id=section.id, name="SALDO INICIAL", sort_order=0, row_type="running_balance")
+    income = SheetRow(section_id=section.id, name="Sueldo", sort_order=1,
+                       default_projection_rule={"type": "constant", "value": 1000})
+    db.add_all([opening, income])
+    db.flush()
+    closing = SheetRow(
+        section_id=section.id, name="SALDO FINAL", sort_order=2, row_type="running_balance",
+        default_projection_rule={"type": "sum_rows", "row_ids": [opening.id, income.id]},
+    )
+    db.add(closing)
+    db.flush()
+    opening.default_projection_rule = {"type": "previous_period", "row_id": closing.id}
+    db.commit()
+
+    periods = _get_periods(db, sheet.id)
+    matrix = compute_sheet(
+        sheet.id, db, value_overrides={(closing.id, periods[0].id): Decimal("5000")},
+    )
+    assert [c.projected_value for c in _cells_for(matrix, closing.id)] == [
+        Decimal("5000"), Decimal("6000"), Decimal("7000"),
+    ]
+    assert [c.projected_value for c in _cells_for(matrix, opening.id)] == [
+        None, Decimal("5000"), Decimal("6000"),
+    ]
+
+
+def test_value_override_never_persists(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+    row = SheetRow(section_id=section.id, name="Fila", sort_order=0,
+                    default_projection_rule={"type": "constant", "value": 100})
+    db.add(row)
+    db.commit()
+    period = _get_periods(db, sheet.id)[0]
+
+    matrix = compute_sheet(sheet.id, db, value_overrides={(row.id, period.id): Decimal("999")})
+    assert _cells_for(matrix, row.id)[0].projected_value == Decimal("999")
+
+    # Nothing written: no SheetCell, no CellOverride, and a plain compute
+    # (no value_overrides) goes right back to the row's own rule.
+    assert db.query(SheetCell).filter(SheetCell.row_id == row.id).count() == 0
+    assert db.query(CellOverride).count() == 0
+    plain = compute_sheet(sheet.id, db)
+    assert _cells_for(plain, row.id)[0].projected_value == Decimal("100")
+
+
+def test_value_override_takes_priority_over_a_real_manual_override(db):
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+    row = SheetRow(section_id=section.id, name="Fila", sort_order=0,
+                    default_projection_rule={"type": "constant", "value": 100})
+    db.add(row)
+    db.commit()
+    period = _get_periods(db, sheet.id)[0]
+
+    cell = SheetCell(row_id=row.id, period_id=period.id)
+    db.add(cell)
+    db.flush()
+    db.add(CellOverride(cell_id=cell.id, value=Decimal("250"), override_type="manual_value", created_by=TEST_USER_ID))
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db, value_overrides={(row.id, period.id): Decimal("999")})
+    assert _cells_for(matrix, row.id)[0].projected_value == Decimal("999")
