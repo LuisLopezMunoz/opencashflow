@@ -36,8 +36,8 @@ from opencashflow.wallet import Wallet, WalletMovement
 @dataclasses.dataclass
 class WalletMovementResult:
     movement: WalletMovement
-    wallet_balance_before: float
-    wallet_balance_after: float
+    wallet_balance_before: Decimal
+    wallet_balance_after: Decimal
     cell_paid_before: Optional[Decimal]
     cell_paid_after: Decimal
 
@@ -78,7 +78,7 @@ def do_wallet_movement_add(
     db.add(entry)
     db.flush()
 
-    wallet_delta = float(sign * amount)
+    wallet_delta = sign * amount
     balance_before = wallet.balance
     wallet.balance = balance_before + wallet_delta
 
@@ -101,8 +101,8 @@ def do_wallet_movement_add(
 class WalletMovementUndoResult:
     original: WalletMovement
     reversal: WalletMovement
-    wallet_balance_before: float
-    wallet_balance_after: float
+    wallet_balance_before: Decimal
+    wallet_balance_after: Decimal
 
 
 def do_wallet_movement_undo(

@@ -14,7 +14,7 @@ a host app's own user table or its SQLAlchemy registry.
 """
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String
 from sqlalchemy.orm import relationship
 
 from opencashflow.models import Base
@@ -29,7 +29,7 @@ class Wallet(Base):
     name = Column(String(100), nullable=False)
     wallet_type = Column(String(50), nullable=False, default="cash")
     currency = Column(String(10), nullable=False, default="USD")
-    balance = Column(Float, nullable=False, default=0.0)
+    balance = Column(Numeric(14, 2), nullable=False, default=0)
     description = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -70,7 +70,7 @@ class WalletMovement(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
 
     sheet_id = Column(Integer, nullable=False)
     row_id = Column(Integer, nullable=False)

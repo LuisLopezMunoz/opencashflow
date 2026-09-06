@@ -95,6 +95,25 @@ def test_income_row_credits_the_wallet(db, built):
     assert result.movement.amount == 500_000.0
 
 
+def test_wallet_balance_and_movement_amount_are_real_decimals(db, built):
+    # Regression: Wallet.balance/WalletMovement.amount used to be Float --
+    # the VALUE could look right (Decimal == float compares fine for exact
+    # values) while the TYPE silently wasn't Decimal at all. Assert the type
+    # explicitly, not just the value.
+    wallet, sueldo, period = built["wallet"], built["sueldo"], built["period1"]
+    result = do_wallet_movement_add(db, wallet, built["sheet"].id, sueldo, period, Decimal("500000"),
+                                     note="sueldo enero", created_by=TEST_USER_ID)
+    assert isinstance(result.wallet_balance_before, Decimal)
+    assert isinstance(result.wallet_balance_after, Decimal)
+    assert isinstance(result.movement.amount, Decimal)
+    assert isinstance(wallet.balance, Decimal)
+
+    undo_result = do_wallet_movement_undo(db, result.movement, note="deshacer", created_by=TEST_USER_ID)
+    assert isinstance(undo_result.wallet_balance_before, Decimal)
+    assert isinstance(undo_result.wallet_balance_after, Decimal)
+    assert isinstance(undo_result.reversal.amount, Decimal)
+
+
 def test_expense_row_debits_the_wallet(db, built):
     wallet, arriendo, period = built["wallet"], built["arriendo"], built["period1"]
     result = do_wallet_movement_add(db, wallet, built["sheet"].id, arriendo, period, Decimal("400000"),
