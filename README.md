@@ -13,16 +13,27 @@ reemplazan). Ver [docs/model.md](docs/model.md) para el glosario completo del do
 
 ## Instalación
 
+Para usarlo como programa de línea de comandos (no necesitas saber Python ni manejar
+un entorno virtual):
+
 ```bash
-pip install "opencashflow @ git+https://github.com/LuisLopezMunoz/opencashflow.git@v0.1.0"
+pipx install opencashflow
 ```
 
-(Todavía no está publicado en PyPI — instalar directamente desde el repositorio.)
+([pipx](https://pypa.github.io/pipx/) instala el paquete en un entorno aislado propio y
+deja el comando `opencashflow` disponible en tu shell -- funciona igual sin importar
+desde qué carpeta lo ejecutes.)
 
-Esto también instala el comando `opencashflow` (equivalente a `python -m
-opencashflow.cli`) -- una CLI standalone, independiente de cualquier app consumidora
-(sin ledger, sin auth multiusuario), útil para probar la librería o correr el demo de
-abajo.
+Para usarlo como librería dentro de otro proyecto Python:
+
+```bash
+pip install opencashflow
+```
+
+Cualquiera de las dos formas instala también el comando `opencashflow` (equivalente a
+`python -m opencashflow.cli`) -- una CLI standalone, independiente de cualquier app
+consumidora (sin ledger, sin auth multiusuario), útil para probar la librería o correr
+el demo de abajo.
 
 ## Demo en un minuto
 

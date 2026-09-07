@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from opencashflow import __version__
 from opencashflow.cli_export import export_csv, export_xlsx
 from opencashflow.credit_card import CreditCard
 from opencashflow.creditcard_statements import (
@@ -105,7 +106,7 @@ def _pick_sheet(db, sheet_id: int) -> CashflowSheet:
         return sheet
     sheet = db.query(CashflowSheet).order_by(CashflowSheet.created_at.desc(), CashflowSheet.id.desc()).first()
     if not sheet:
-        print("No hay planillas todavía. Corre primero: python -m backend.cli seed", file=sys.stderr)
+        print("No hay planillas todavía. Corre primero: opencashflow seed", file=sys.stderr)
         sys.exit(1)
     return sheet
 
@@ -167,7 +168,7 @@ def _resolve_row(db, sheet_id: int, row_arg: str) -> SheetRow:
         sys.exit(1)
 
     print(f"No se encontró ninguna fila que coincida con '{row_arg}' en la planilla #{sheet_id}.", file=sys.stderr)
-    print(f"Corre 'python -m backend.cli show --sheet-id {sheet_id} --show-ids' para ver las filas disponibles.",
+    print(f"Corre 'opencashflow show --sheet-id {sheet_id} --show-ids' para ver las filas disponibles.",
           file=sys.stderr)
     sys.exit(1)
 
@@ -211,7 +212,7 @@ def _resolve_section(db, sheet_id: int, section_arg: str) -> SheetSection:
 
     print(f"No se encontró ninguna sección que coincida con '{section_arg}' en la planilla #{sheet_id}.",
           file=sys.stderr)
-    print(f"Corre 'python -m backend.cli sections --sheet-id {sheet_id}' para ver las secciones disponibles.",
+    print(f"Corre 'opencashflow sections --sheet-id {sheet_id}' para ver las secciones disponibles.",
           file=sys.stderr)
     sys.exit(1)
 
@@ -1157,7 +1158,7 @@ def _do_clear_override(db, sheet_id: int, row: SheetRow, periods: List[SheetPeri
 def cmd_sheets(db, args) -> None:
     sheets = db.query(CashflowSheet).order_by(CashflowSheet.created_at.desc()).all()
     if not sheets:
-        print("No hay planillas. Corre: python -m backend.cli seed")
+        print("No hay planillas. Corre: opencashflow seed")
         return
     for sheet in sheets:
         print(
@@ -1255,7 +1256,7 @@ def cmd_section_add(db, args) -> None:
     section = _do_add_section(db, sheet, args.name, args.type, args.sort_order)
     print(f"[OK] Sección creada: [{section.id}] {section.name}  tipo={section.section_type}  orden={section.sort_order}")
     print(
-        f"Siguiente paso: python -m backend.cli row add --sheet-id {sheet.id} --section {section.id} --name \"...\""
+        f"Siguiente paso: opencashflow row add --sheet-id {sheet.id} --section {section.id} --name \"...\""
     )
 
 
@@ -3649,6 +3650,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m opencashflow.cli",
         description="CLI standalone del motor opencashflow -- superficie genérica de comandos, "
                      "para probar la librería sin ninguna app consumidora.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"opencashflow {__version__}",
     )
     parser.add_argument(
         "--db-url", type=str, default=None,
