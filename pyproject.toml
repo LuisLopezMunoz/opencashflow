@@ -9,6 +9,21 @@ description = "Motor de proyección de flujo de caja: modelos SQLAlchemy, engine
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
+authors = [
+    { name = "Luis Alfredo López", email = "luis@bmya.cl" },
+]
+keywords = ["cashflow", "finance", "budgeting", "sqlalchemy", "projection"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
 dependencies = [
     "sqlalchemy>=2.0,<3",
     "pydantic>=2.5,<3",
@@ -17,6 +32,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/LuisLopezMunoz/opencashflow"
+Repository = "https://github.com/LuisLopezMunoz/opencashflow"
+Issues = "https://github.com/LuisLopezMunoz/opencashflow/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
