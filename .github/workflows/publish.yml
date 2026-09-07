@@ -9,6 +9,7 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch: {}  # manual "Run workflow" button, for a first-time test run
 
 jobs:
   build:
