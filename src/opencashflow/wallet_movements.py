@@ -27,8 +27,10 @@ import dataclasses
 from decimal import Decimal
 from typing import Optional
 
+from sqlalchemy.exc import IntegrityError
+
 from opencashflow.engine import build_sum_rows_hierarchy, effective_sign_to_top
-from opencashflow.models import CellActualEntry, SheetCell, SheetPeriod, SheetRow
+from opencashflow.models import CellActualEntry, SheetCell, SheetPeriod, SheetRow, get_or_create_cell
 from opencashflow.record_stack import guard_periods_not_closed, pop_record_stack, replay_record_stack
 from opencashflow.wallet import Wallet, WalletMovement
 
@@ -51,6 +53,22 @@ def do_wallet_movement_add(
             "amount must be a positive number -- the row decides the sign (an income row adds "
             "to the wallet, an expense row subtracts), it is never asked for separately."
         )
+    if period.sheet_id != sheet_id:
+        raise ValueError(
+            f"Period #{period.id} belongs to sheet #{period.sheet_id}, not sheet #{sheet_id} -- "
+            f"the caller passed a sheet_id/period pair that don't match."
+        )
+    if row.section.sheet_id != sheet_id:
+        raise ValueError(
+            f"Row '{row.name}' belongs to sheet #{row.section.sheet_id}, not sheet #{sheet_id} -- "
+            f"the caller passed a sheet_id/row pair that don't match."
+        )
+    if wallet.currency != period.sheet.currency:
+        raise ValueError(
+            f"Wallet '{wallet.name}' is in {wallet.currency} but sheet #{sheet_id} is in "
+            f"{period.sheet.currency} -- recording this movement would silently mix amounts "
+            f"from two different currencies with no conversion."
+        )
     guard_periods_not_closed([period], "record a wallet movement")
 
     rows_by_id, child_to_parent = build_sum_rows_hierarchy(db, sheet_id)
@@ -61,11 +79,7 @@ def do_wallet_movement_add(
             f"whether a movement in it adds to or subtracts from the wallet."
         )
 
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row.id, SheetCell.period_id == period.id).first()
-    if cell is None:
-        cell = SheetCell(row_id=row.id, period_id=period.id)
-        db.add(cell)
-        db.flush()
+    cell = get_or_create_cell(db, row.id, period.id)
 
     paid_before = cell.paid_value
     paid_after = (paid_before if paid_before is not None else Decimal(0)) + amount
@@ -143,7 +157,17 @@ def do_wallet_movement_undo(
         note=note, created_by=created_by,
     )
     db.add(reversal)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The plain SELECT-based "already reversed" check above has a real
+        # TOCTOU race: two concurrent undo calls on the same movement can
+        # both pass it before either commits. wallet.py's unique constraint
+        # on reverses_movement_id is the actual backstop -- translate its
+        # violation into the same ValueError the check above already raises
+        # for the non-concurrent case, so callers see one consistent error.
+        db.rollback()
+        raise ValueError(f"Movement #{movement.id} was already reversed.") from None
     db.refresh(reversal)
     db.refresh(wallet)
 

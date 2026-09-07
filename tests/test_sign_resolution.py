@@ -7,7 +7,6 @@ the topmost aggregate go up or down" -- independent of compute_sheet()
 itself, no HTTP, no auth.
 """
 from datetime import datetime
-from decimal import Decimal
 
 import pytest
 from sqlalchemy import create_engine
@@ -60,6 +59,20 @@ def test_row_sign_multiplier():
     assert row_sign_multiplier(negative) == -1
 
 
+def test_row_sign_multiplier_rejects_invalid_sign():
+    # SheetRow.sign now has an @validates guard, so a bad value can no
+    # longer be *written* via the ORM going forward -- but a database
+    # created before that guard existed could still hold one. Bypass the
+    # validator (poking __dict__ directly, the same way a row loaded from
+    # such a legacy database would arrive) to confirm row_sign_multiplier
+    # itself still refuses to silently treat it as "negative" (-1) instead
+    # of raising.
+    row = SheetRow(sign="positive")
+    row.__dict__["sign"] = "positivo"
+    with pytest.raises(ValueError, match="sign"):
+        row_sign_multiplier(row)
+
+
 def test_row_with_no_parent_returns_none_not_zero(db):
     sheet = _sheet(db)
     section = _section(db, sheet)
@@ -98,8 +111,8 @@ def test_ambiguous_parent_raises(db):
     section = _section(db, sheet)
     leaf = _row(db, section, "Shared Leaf")
     db.commit()
-    parent_a = _row(db, section, "Parent A", rule={"type": "sum_rows", "row_ids": [leaf.id]})
-    parent_b = _row(db, section, "Parent B", rule={"type": "sum_rows", "row_ids": [leaf.id]})
+    _row(db, section, "Parent A", rule={"type": "sum_rows", "row_ids": [leaf.id]})
+    _row(db, section, "Parent B", rule={"type": "sum_rows", "row_ids": [leaf.id]})
     db.commit()
 
     with pytest.raises(ValueError, match="more than one row"):

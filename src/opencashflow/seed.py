@@ -10,7 +10,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from opencashflow.models import CashflowSheet, CellOverride, SheetCell, SheetRow, SheetSection
+from opencashflow.models import CashflowSheet, SheetRow, SheetSection, get_or_create_cell, supersede_and_write_override
 from opencashflow.periods import generate_periods
 
 SHEET_NAME = "Flujo de Caja Personal"
@@ -60,17 +60,8 @@ def _add_row(db, section_id: int, name: str, sort_order: int, row_type: str = "i
 
 
 def _override(db, user_id: int, row_id: int, period_id: int, value) -> None:
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row_id, SheetCell.period_id == period_id).first()
-    if not cell:
-        cell = SheetCell(row_id=row_id, period_id=period_id)
-        db.add(cell)
-        db.flush()
-    db.add(CellOverride(
-        cell_id=cell.id,
-        value=Decimal(str(value)),
-        override_type="manual_value",
-        created_by=user_id,
-    ))
+    cell = get_or_create_cell(db, row_id, period_id)
+    supersede_and_write_override(db, cell, Decimal(str(value)), created_by=user_id)
 
 
 def seed_sheet(db: Session, user_id: int, months: int, base_period: date) -> CashflowSheet:
@@ -138,7 +129,7 @@ def seed_sheet(db: Session, user_id: int, months: int, base_period: date) -> Cas
                                        sign="negative")
 
     r_ahorro = _add_row(db, sec_resumen.id, "Ahorro programado", 0, row_type="formula", sign="negative")
-    r_imprevistos = _add_row(db, sec_resumen.id, "Imprevistos", 1)  # deliberately ruleless
+    _add_row(db, sec_resumen.id, "Imprevistos", 1)  # deliberately ruleless
     r_flujo_neto = _add_row(db, sec_resumen.id, "FLUJO NETO DEL MES", 2, row_type="total")
     r_saldo_final = _add_row(db, sec_resumen.id, "SALDO FINAL", 3, row_type="running_balance")
 

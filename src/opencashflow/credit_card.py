@@ -15,12 +15,12 @@ convention as CashflowSheet.user_id (see models.py): this package takes no
 dependency on a host app's own user table or its SQLAlchemy registry.
 """
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Column,
     Date,
     DateTime,
-    Float,
     ForeignKey,
     Integer,
     Numeric,
@@ -28,8 +28,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, validates
 
+from opencashflow.enums import CREDIT_CARD_STATUSES, STATEMENT_LINE_TYPES, STATEMENT_SOURCES
 from opencashflow.models import Base
 
 
@@ -41,15 +42,34 @@ class CreditCard(Base):
     user_id = Column(Integer, nullable=False, index=True)
     name = Column(String(100), nullable=False)
     bank = Column(String(100), nullable=True)
-    credit_limit = Column(Float, nullable=False)
-    current_balance = Column(Float, nullable=False, default=0.0)
+    # Numeric(14, 2), matching every other money column in this package --
+    # these four used to be Float ("to avoid an unrelated migration", per a
+    # comment on CreditCardCharge.amount predating this change). See
+    # MIGRATIONS.md: on SQLite this needs no ALTER TABLE at all -- SQLite's
+    # loose column typing means existing values already read back correctly
+    # as Decimal through the new Numeric declaration.
+    credit_limit = Column(Numeric(14, 2), nullable=False)
+    # DEPRECATED: the old bookkeeping counter the statement-tracking feature
+    # (creditcard_statements.py) supersedes. Never read by any computation in
+    # this package -- cupo_disponible()/compute_instant_statement() derive
+    # available credit from CreditCardCharge/CreditCardStatement instead. Set
+    # only to its 0.0 default by every caller; kept for backward
+    # compatibility with any consumer still reading it directly, not because
+    # anything here still relies on it.
+    current_balance = Column(Numeric(14, 2), nullable=False, default=0)
     currency = Column(String(10), nullable=False, default="USD")
     closing_day = Column(Integer, nullable=True)  # day of month when statement closes
     due_day = Column(Integer, nullable=True)      # day of month payment is due
-    # Annual interest rate (e.g. 0.24 for 24 %) agreed with the bank (tasa pactada)
-    interest_rate = Column(Float, nullable=False, default=0.0)
-    # Minimum payment as a fraction of the current balance (e.g. 0.05 for 5 %)
-    minimum_payment_rate = Column(Float, nullable=False, default=0.05)
+    # RESERVED/INERT: stored and settable via the CLI's create/update
+    # commands, but grep-confirmed unread by any computation in this
+    # package -- no interest-accrual or minimum-payment-due projection is
+    # implemented yet. Annual interest rate (e.g. 0.24 for 24 %) agreed with
+    # the bank (tasa pactada), for whenever that projection is built.
+    interest_rate = Column(Numeric(14, 2), nullable=False, default=0)
+    # RESERVED/INERT, same situation as interest_rate above: minimum payment
+    # as a fraction of the current balance (e.g. 0.05 for 5 %), unused by any
+    # computation today.
+    minimum_payment_rate = Column(Numeric(14, 2), nullable=False, default=Decimal("0.05"))
     # Cross-registry reference to THIS SAME package's CashflowSheet.id /
     # SheetRow.id -- plain Integer, not a real FK, since a consuming app is
     # free to create a CreditCard before ever mapping it to a sheet row.
@@ -88,6 +108,14 @@ class CreditCard(Base):
         "CreditCardStatement", back_populates="credit_card", cascade="all, delete-orphan"
     )
 
+    @validates("status")
+    def _validate_status(self, key: str, value: str) -> str:
+        if value not in CREDIT_CARD_STATUSES:
+            raise ValueError(
+                f"status debe ser uno de {CREDIT_CARD_STATUSES}, se recibió {value!r}"
+            )
+        return value
+
 
 class CreditCardCharge(Base):
     __tablename__ = "credit_card_charges"
@@ -99,12 +127,13 @@ class CreditCardCharge(Base):
     # installments=12, never as the ~100k/month per-cuota figure. Contrast
     # with CreditCardStatementLine.amount below, which IS the per-line
     # (per-cuota) amount -- never confuse the two.
-    # Numeric, not Float, on purpose (unlike every other money field on
-    # CreditCard/CreditCardCharge, which predate the statement-tracking
-    # feature and stay Float to avoid an unrelated migration): this value
-    # feeds compute_instant_statement's Decimal(str(charge.amount)) call and,
-    # from there, installment_schedule -> SheetCell, which are Numeric/Decimal
-    # throughout the core engine.
+    # Numeric, matching every other money field on this model and on
+    # CreditCard (see MIGRATIONS.md -- CreditCard's four money columns used
+    # to be Float, predating the statement-tracking feature this one was
+    # added for): this value feeds compute_instant_statement's
+    # Decimal(str(charge.amount)) call and, from there,
+    # installment_schedule -> SheetCell, which are Numeric/Decimal throughout
+    # the core engine.
     amount = Column(Numeric(14, 2), nullable=False)
     description = Column(String(255), nullable=True)
     category = Column(String(100), nullable=True)
@@ -197,6 +226,14 @@ class CreditCardStatement(Base):
         "CreditCardStatementLine", back_populates="statement", cascade="all, delete-orphan"
     )
 
+    @validates("source")
+    def _validate_source(self, key: str, value: str) -> str:
+        if value not in STATEMENT_SOURCES:
+            raise ValueError(
+                f"source debe ser uno de {STATEMENT_SOURCES}, se recibió {value!r}"
+            )
+        return value
+
 
 class CreditCardStatementLine(Base):
     """One printed line item of a real CreditCardStatement -- a charge,
@@ -235,3 +272,11 @@ class CreditCardStatementLine(Base):
 
     statement = relationship("CreditCardStatement", back_populates="lines")
     charge = relationship("CreditCardCharge", back_populates="statement_lines")
+
+    @validates("line_type")
+    def _validate_line_type(self, key: str, value: str) -> str:
+        if value not in STATEMENT_LINE_TYPES:
+            raise ValueError(
+                f"line_type debe ser uno de {STATEMENT_LINE_TYPES}, se recibió {value!r}"
+            )
+        return value

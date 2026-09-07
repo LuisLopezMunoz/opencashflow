@@ -1,4 +1,6 @@
 from datetime import datetime
+from decimal import Decimal
+from typing import Any, Dict, Optional
 
 from sqlalchemy import (
     JSON,
@@ -12,12 +14,18 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import DeclarativeBase, Session, relationship, validates
+
+from opencashflow.enums import ENTRY_KINDS, OVERRIDE_TYPES, ROW_SIGNS, ROW_TYPES, SECTION_TYPES
 
 # Owned by this package: opencashflow has no dependency on a host app's
 # users/auth/ledger tables or on their SQLAlchemy registry. See models below
 # for how ownership (user_id/created_by) is represented without a ForeignKey.
-Base = declarative_base()
+# DeclarativeBase (not the legacy declarative_base()) so mypy can resolve it
+# as a valid base class -- everything below still uses the classic
+# Column()/relationship() imperative style, which DeclarativeBase supports.
+class Base(DeclarativeBase):
+    pass
 
 
 class CashflowSheet(Base):
@@ -37,11 +45,22 @@ class CashflowSheet(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # cascade="save-update, merge" (no delete-orphan): sections/periods --
+    # and everything beneath them (rows, cells, overrides, actual_entries)
+    # -- are never meant to disappear just because their parent sheet is
+    # deleted from a session. CellOverride/CellActualEntry are explicitly
+    # documented as append-only audit trails; letting an ORM-level cascade
+    # silently destroy that trail the moment someone deletes a CashflowSheet
+    # would contradict that guarantee. No code path calls db.delete() on any
+    # of these today, so this is preventive: an eventual delete/archive
+    # feature should use an explicit soft-delete flag instead.
     sections = relationship(
-        "SheetSection", back_populates="sheet", cascade="all, delete-orphan", order_by="SheetSection.sort_order"
+        "SheetSection", back_populates="sheet", cascade="save-update, merge", passive_deletes=True,
+        order_by="SheetSection.sort_order",
     )
     periods = relationship(
-        "SheetPeriod", back_populates="sheet", cascade="all, delete-orphan", order_by="SheetPeriod.sort_order"
+        "SheetPeriod", back_populates="sheet", cascade="save-update, merge", passive_deletes=True,
+        order_by="SheetPeriod.sort_order",
     )
 
 
@@ -60,9 +79,21 @@ class SheetSection(Base):
     color_hex = Column(String(7), nullable=True)
 
     sheet = relationship("CashflowSheet", back_populates="sections")
+    # No delete-orphan -- see CashflowSheet.sections' comment: a section's
+    # rows (and their cells/overrides/actual_entries) must survive the
+    # section being deleted from a session, not cascade away with it.
     rows = relationship(
-        "SheetRow", back_populates="section", cascade="all, delete-orphan", order_by="SheetRow.sort_order"
+        "SheetRow", back_populates="section", cascade="save-update, merge", passive_deletes=True,
+        order_by="SheetRow.sort_order",
     )
+
+    @validates("section_type")
+    def _validate_section_type(self, key: str, value: str) -> str:
+        if value not in SECTION_TYPES:
+            raise ValueError(
+                f"section_type debe ser uno de {SECTION_TYPES}, se recibió {value!r}"
+            )
+        return value
 
 
 class SheetRow(Base):
@@ -89,7 +120,10 @@ class SheetRow(Base):
     notes = Column(Text, nullable=True)
 
     section = relationship("SheetSection", back_populates="rows")
-    cells = relationship("SheetCell", back_populates="row", cascade="all, delete-orphan")
+    # No delete-orphan -- see CashflowSheet.sections' comment: a row's cells
+    # (and their overrides/actual_entries) must survive the row being
+    # deleted from a session, not cascade away with it.
+    cells = relationship("SheetCell", back_populates="row", cascade="save-update, merge", passive_deletes=True)
     # Dependencies where this row is the target (consumes values from other rows)
     incoming_deps = relationship(
         "CellDependency",
@@ -104,6 +138,18 @@ class SheetRow(Base):
         back_populates="source_row",
         cascade="all, delete-orphan",
     )
+
+    @validates("row_type")
+    def _validate_row_type(self, key: str, value: str) -> str:
+        if value not in ROW_TYPES:
+            raise ValueError(f"row_type debe ser uno de {ROW_TYPES}, se recibió {value!r}")
+        return value
+
+    @validates("sign")
+    def _validate_sign(self, key: str, value: str) -> str:
+        if value not in ROW_SIGNS:
+            raise ValueError(f"sign debe ser uno de {ROW_SIGNS}, se recibió {value!r}")
+        return value
 
 
 class SheetPeriod(Base):
@@ -122,7 +168,10 @@ class SheetPeriod(Base):
     sort_order = Column(Integer, nullable=False, default=0)
 
     sheet = relationship("CashflowSheet", back_populates="periods")
-    cells = relationship("SheetCell", back_populates="period", cascade="all, delete-orphan")
+    # No delete-orphan -- see CashflowSheet.sections' comment: a period's
+    # cells (and their overrides/actual_entries) must survive the period
+    # being deleted from a session, not cascade away with it.
+    cells = relationship("SheetCell", back_populates="period", cascade="save-update, merge", passive_deletes=True)
 
 
 class SheetCell(Base):
@@ -135,13 +184,22 @@ class SheetCell(Base):
     row_id = Column(Integer, ForeignKey("sheet_rows.id"), nullable=False, index=True)
     period_id = Column(Integer, ForeignKey("sheet_periods.id"), nullable=False, index=True)
 
-    # Projection layer (derived from rules + overrides)
+    # RESERVED, not populated in V1 -- do not assume this is written. The
+    # engine computes a projected value per (row, period) fresh on every
+    # compute_sheet() call into an in-memory engine.CellResult, and never
+    # persists it back onto this column (grep-confirmed: nothing in this
+    # package ever assigns SheetCell.projected_value). Kept for a possible
+    # future persisted-results cache.
     projected_value = Column(Numeric(14, 2), nullable=True)
-    # Real layer (pulled from ledger — populated separately)
+    # Real layer (pulled from ledger — populated separately). These three
+    # ARE live: written by wallet_movements.py, period_close.py, and the
+    # CLI's own record commands.
     actual_value = Column(Numeric(14, 2), nullable=True)
     accrued_value = Column(Numeric(14, 2), nullable=True)
     paid_value = Column(Numeric(14, 2), nullable=True)
-    # Computed fields (calculated by the engine, stored for display)
+    # RESERVED, not populated in V1 -- same situation as projected_value
+    # above: engine.CellResult computes pending_value/variance/
+    # effective_source fresh every call and never writes them back here.
     pending_value = Column(Numeric(14, 2), nullable=True)
     variance = Column(Numeric(14, 2), nullable=True)
     # Which source won: manual | rule | ledger | default | empty
@@ -151,11 +209,22 @@ class SheetCell(Base):
 
     row = relationship("SheetRow", back_populates="cells")
     period = relationship("SheetPeriod", back_populates="cells")
+    # No delete-orphan on either audit-trail relationship below -- CellOverride
+    # and CellActualEntry are both explicitly documented as append-only
+    # ("Never updated; replaced by a new record" / "so a correction doesn't
+    # erase the trail"). Deleting a SheetCell must never silently destroy
+    # that trail; see CashflowSheet.sections' comment for the full rationale.
     overrides = relationship(
-        "CellOverride", back_populates="cell", cascade="all, delete-orphan", order_by="CellOverride.created_at"
+        "CellOverride", back_populates="cell", cascade="save-update, merge", passive_deletes=True,
+        # created_at alone doesn't break ties between two rows created in the
+        # same instant (e.g. a tight seed/import loop) -- id is a stable
+        # tiebreaker, and record_stack.py's push/pop algorithm depends on
+        # this relationship being in true chronological order to be correct.
+        order_by="CellOverride.created_at, CellOverride.id",
     )
     actual_entries = relationship(
-        "CellActualEntry", back_populates="cell", cascade="all, delete-orphan", order_by="CellActualEntry.created_at"
+        "CellActualEntry", back_populates="cell", cascade="save-update, merge", passive_deletes=True,
+        order_by="CellActualEntry.created_at, CellActualEntry.id",
     )
     computed_results = relationship(
         "ComputedResult", back_populates="cell", cascade="all, delete-orphan"
@@ -187,6 +256,14 @@ class CellOverride(Base):
 
     cell = relationship("SheetCell", back_populates="overrides")
 
+    @validates("override_type")
+    def _validate_override_type(self, key: str, value: str) -> str:
+        if value not in OVERRIDE_TYPES:
+            raise ValueError(
+                f"override_type debe ser uno de {OVERRIDE_TYPES}, se recibió {value!r}"
+            )
+        return value
+
 
 class CellActualEntry(Base):
     """Append-only audit log of writes to SheetCell's real layer
@@ -209,9 +286,21 @@ class CellActualEntry(Base):
     accrued_value = Column(Numeric(14, 2), nullable=True)
     paid_value = Column(Numeric(14, 2), nullable=True)
     note = Column(String(255), nullable=True)
+    # record | undo -- which record_stack.replay_record_stack used to tell
+    # apart ONLY by sniffing whether `note` happened to start with a magic
+    # string, with nothing reserving that prefix against a caller-supplied
+    # note coincidentally starting the same way (see MIGRATIONS.md for the
+    # backfill this column needed against pre-existing rows).
+    entry_kind = Column(String(10), nullable=False, default="record")
     # Plain user id, not a ForeignKey — see CashflowSheet.user_id.
     created_by = Column(Integer, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    @validates("entry_kind")
+    def _validate_entry_kind(self, key: str, value: str) -> str:
+        if value not in ENTRY_KINDS:
+            raise ValueError(f"entry_kind debe ser uno de {ENTRY_KINDS}, se recibió {value!r}")
+        return value
 
     cell = relationship("SheetCell", back_populates="actual_entries")
 
@@ -220,7 +309,14 @@ class CellDependency(Base):
     """Edge in the row-level dependency graph.
 
     Represents: target_row depends on source_row (possibly from a previous period).
-    Generated automatically when a projection rule is assigned or modified.
+
+    RESERVED, not populated in V1 -- grep-confirmed nothing in this package
+    ever writes or reads a CellDependency row. engine.compute_sheet instead
+    re-derives the dependency graph from SheetRow.default_projection_rule's
+    JSON on every single call; nothing persists it relationally. Do not
+    build a caller against this expecting live data -- despite what this
+    docstring used to imply, nothing generates these rows automatically (or
+    at all) today.
     """
 
     __tablename__ = "cell_dependencies"
@@ -260,3 +356,53 @@ class ComputedResult(Base):
     is_current = Column(Boolean, nullable=False, default=True)
 
     cell = relationship("SheetCell", back_populates="computed_results")
+
+
+# ---------------------------------------------------------------------------
+# Shared write helpers -- "get or create the SheetCell for (row_id,
+# period_id)" and "supersede the active override before writing a new one"
+# used to be reimplemented independently in 5-6 places across this package
+# (seed.py, wallet_movements.py, period_close.py, creditcard_statements.py),
+# with nothing enforcing they stayed in sync. One canonical copy here,
+# reused everywhere, so the uq_cell / "only one active override" invariants
+# below can't drift out from under a future change made in only one spot.
+# ---------------------------------------------------------------------------
+
+def get_or_create_cell(db: Session, row_id: int, period_id: int) -> "SheetCell":
+    cell = db.query(SheetCell).filter(SheetCell.row_id == row_id, SheetCell.period_id == period_id).first()
+    if cell is None:
+        cell = SheetCell(row_id=row_id, period_id=period_id)
+        db.add(cell)
+        db.flush()
+    return cell
+
+
+def supersede_and_write_override(
+    db: Session,
+    cell: "SheetCell",
+    value: Optional[Decimal],
+    *,
+    created_by: int,
+    override_type: str = "manual_value",
+    custom_rule: Optional[Dict[str, Any]] = None,
+    note: Optional[str] = None,
+) -> Optional["CellOverride"]:
+    """Supersede `cell`'s active override (superseded_at is None), if any,
+    then insert the new one. Returns the superseded override (or None) so a
+    caller can tell "replaced an existing override" apart from "this cell
+    had none yet" -- e.g. for a status message."""
+    previous = None
+    for ov in cell.overrides:
+        if ov.superseded_at is None:
+            previous = ov
+            break
+    if previous is not None:
+        previous.superseded_at = datetime.utcnow()
+        db.flush()
+
+    db.add(CellOverride(
+        cell_id=cell.id, value=value, override_type=override_type,
+        custom_rule=custom_rule, note=note, created_by=created_by,
+    ))
+    db.flush()
+    return previous

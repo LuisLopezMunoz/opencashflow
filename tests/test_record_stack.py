@@ -9,7 +9,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from opencashflow.models import Base, CashflowSheet, CellActualEntry, SheetCell, SheetPeriod, SheetRow, SheetSection
-from opencashflow.record_stack import guard_periods_not_closed, pop_record_stack, replay_record_stack
+from opencashflow.record_stack import (
+    EmptyRecordStackError,
+    guard_periods_not_closed,
+    pop_record_stack,
+    replay_record_stack,
+)
 
 TEST_DB_URL = "sqlite:///:memory:"
 TEST_USER_ID = 1
@@ -58,27 +63,38 @@ def _push(db, cell, paid):
 # ---------------------------------------------------------------------------
 
 def test_replay_stack_plain_pushes():
-    e1, e2 = CellActualEntry(note=None), CellActualEntry(note="a real note")
+    e1 = CellActualEntry(note=None, entry_kind="record")
+    e2 = CellActualEntry(note="a real note", entry_kind="record")
+    assert replay_record_stack([e1, e2]) == [e1, e2]
+
+
+def test_replay_stack_ignores_note_text_and_reads_entry_kind_only():
+    """A caller-supplied note happening to start with the old (now purely
+    cosmetic) undo-marker text must NOT be mistaken for an undo -- this is
+    exactly the corruption risk entry_kind replaces note-sniffing to close."""
+    e1 = CellActualEntry(note=None, entry_kind="record")
+    e2 = CellActualEntry(note="[record undo] this is a real note, not an undo", entry_kind="record")
     assert replay_record_stack([e1, e2]) == [e1, e2]
 
 
 def test_replay_stack_undo_pops_the_top():
-    e1, e2 = CellActualEntry(note=None), CellActualEntry(note="[record undo] ")
+    e1 = CellActualEntry(note=None, entry_kind="record")
+    e2 = CellActualEntry(note="[record undo] ", entry_kind="undo")
     assert replay_record_stack([e1, e2]) == []
 
 
 def test_replay_stack_repeated_undo_walks_backward_not_ping_pong():
-    e1 = CellActualEntry(note=None)
-    e2 = CellActualEntry(note=None)
-    e3 = CellActualEntry(note=None)
-    undo1 = CellActualEntry(note="[record undo] ")  # pops e3
-    undo2 = CellActualEntry(note="[record undo] ")  # must pop e2, NOT redo e3
+    e1 = CellActualEntry(note=None, entry_kind="record")
+    e2 = CellActualEntry(note=None, entry_kind="record")
+    e3 = CellActualEntry(note=None, entry_kind="record")
+    undo1 = CellActualEntry(note="[record undo] ", entry_kind="undo")  # pops e3
+    undo2 = CellActualEntry(note="[record undo] ", entry_kind="undo")  # must pop e2, NOT redo e3
     assert replay_record_stack([e1, e2, e3, undo1]) == [e1, e2]
     assert replay_record_stack([e1, e2, e3, undo1, undo2]) == [e1]
 
 
 def test_replay_stack_undo_on_empty_stack_is_a_noop():
-    undo = CellActualEntry(note="[record undo] ")
+    undo = CellActualEntry(note="[record undo] ", entry_kind="undo")
     assert replay_record_stack([undo]) == []
 
 
@@ -116,6 +132,7 @@ def test_pop_reverts_to_the_previous_entry(db):
     assert reverted_to.paid_value == Decimal("100")
     assert cell.paid_value == Decimal("100")
     assert new_entry.note == "[record undo] test undo"
+    assert new_entry.entry_kind == "undo"
 
 
 def test_pop_with_only_one_entry_reverts_to_none(db):
@@ -129,9 +146,13 @@ def test_pop_with_only_one_entry_reverts_to_none(db):
     assert cell.paid_value is None
 
 
-def test_pop_on_empty_stack_raises_sentinel(db):
+def test_pop_on_empty_stack_raises_empty_record_stack_error(db):
     cell = _cell(db)
-    with pytest.raises(ValueError, match="__empty_stack__"):
+    with pytest.raises(EmptyRecordStackError):
+        pop_record_stack(db, cell, note=None, created_by=TEST_USER_ID)
+    # Still a plain ValueError too -- an existing `except ValueError:` (e.g.
+    # cli.py's own caller) keeps working exactly as before.
+    with pytest.raises(ValueError):
         pop_record_stack(db, cell, note=None, created_by=TEST_USER_ID)
 
 

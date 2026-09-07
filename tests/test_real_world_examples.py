@@ -16,7 +16,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from opencashflow.engine import compute_sheet
-from opencashflow.models import Base, CashflowSheet, CellOverride, SheetCell, SheetPeriod, SheetRow, SheetSection
+from opencashflow.models import Base, CashflowSheet, CellOverride, SheetCell, SheetRow, SheetSection
 from opencashflow.periods import generate_periods
 
 TEST_DB_URL = "sqlite:///:memory:"

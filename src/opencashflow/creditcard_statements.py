@@ -30,8 +30,18 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
+from sqlalchemy.orm import Session
+
 from opencashflow.credit_card import CreditCard, CreditCardCharge, CreditCardStatement, CreditCardStatementLine
-from opencashflow.models import CashflowSheet, CellActualEntry, CellOverride, SheetCell, SheetPeriod, SheetRow
+from opencashflow.models import (
+    CashflowSheet,
+    CellActualEntry,
+    SheetCell,
+    SheetPeriod,
+    SheetRow,
+    get_or_create_cell,
+    supersede_and_write_override,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +114,7 @@ def _payment_lag_months(card: CreditCard) -> int:
     return 1 if card.due_day < card.closing_day else 0
 
 
-def resolve_credit_card(db, user_id_or_none: Optional[int], card_arg: str) -> CreditCard:
+def resolve_credit_card(db: Session, user_id_or_none: Optional[int], card_arg: str) -> CreditCard:
     """Resolve `card_arg` (numeric id, exact name, or substring) to a
     CreditCard, optionally scoped to `user_id_or_none`'s own cards. Raises
     ValueError (never sys.exit) listing every candidate on ambiguity --
@@ -116,8 +126,12 @@ def resolve_credit_card(db, user_id_or_none: Optional[int], card_arg: str) -> Cr
 
     scope_note = f" del usuario #{user_id_or_none}" if user_id_or_none is not None else ""
 
-    if card_arg.isdigit():
-        card = query.filter(CreditCard.id == int(card_arg)).first()
+    # .strip() first: " 5" or "5 " (e.g. copy-pasted from elsewhere) is not
+    # .isdigit()-true on its own, so without stripping this silently falls
+    # through to the name-substring match below instead of the numeric-id
+    # lookup a caller clearly meant.
+    if card_arg.strip().isdigit():
+        card = query.filter(CreditCard.id == int(card_arg.strip())).first()
         if card is None:
             raise ValueError(f"No existe la tarjeta #{card_arg}{scope_note}.")
         return card
@@ -175,7 +189,30 @@ def _installment_number_for_period(first_statement_period: date, period: date) -
     return months_diff + 1
 
 
-def compute_instant_statement(db, card: CreditCard, period: date) -> InstantStatement:
+def _find_statement(db: Session, card_id: int, billing_period: date) -> Optional[CreditCardStatement]:
+    """The CreditCardStatement for this exact (card, billing_period), or
+    None. Previously reimplemented independently 4 times (compute_instant_statement,
+    _real_remaining_principal, _cupo_disponible_real_ahora, _sync_period_write)."""
+    return (
+        db.query(CreditCardStatement)
+        .filter(CreditCardStatement.credit_card_id == card_id, CreditCardStatement.billing_period == billing_period)
+        .first()
+    )
+
+
+def _active_charges(db: Session, card_id: int) -> List[CreditCardCharge]:
+    """Every charge on this card that's tracked for statement projection
+    (has a first_statement_period set). Previously reimplemented
+    independently 3 times (compute_instant_statement, _cupo_disponible_detail,
+    _cupo_disponible_real_ahora)."""
+    return (
+        db.query(CreditCardCharge)
+        .filter(CreditCardCharge.credit_card_id == card_id, CreditCardCharge.first_statement_period.isnot(None))
+        .all()
+    )
+
+
+def compute_instant_statement(db: Session, card: CreditCard, period: date) -> InstantStatement:
     """The "live" view of `card`'s statement as it affects the cashflow
     sheet's `period` (day-normalized to the 1st of the month, and understood
     as the PAYMENT month, not the billing month -- see _payment_lag_months):
@@ -186,11 +223,7 @@ def compute_instant_statement(db, card: CreditCard, period: date) -> InstantStat
     period_norm = date(period.year, period.month, 1)
     billing_period_norm = _shift_months(period_norm, -_payment_lag_months(card))
 
-    real_statement = (
-        db.query(CreditCardStatement)
-        .filter(CreditCardStatement.credit_card_id == card.id, CreditCardStatement.billing_period == billing_period_norm)
-        .first()
-    )
+    real_statement = _find_statement(db, card.id, billing_period_norm)
     if real_statement is not None:
         lines = [
             InstantStatementLine(
@@ -229,11 +262,7 @@ def compute_instant_statement(db, card: CreditCard, period: date) -> InstantStat
     # a REAL line on some other already-real statement (never double count).
     lines: List[InstantStatementLine] = []
     charges_due_this_cycle = Decimal("0")
-    charges = (
-        db.query(CreditCardCharge)
-        .filter(CreditCardCharge.credit_card_id == card.id, CreditCardCharge.first_statement_period.isnot(None))
-        .all()
-    )
+    charges = _active_charges(db, card.id)
     for charge in charges:
         installment_number = _installment_number_for_period(charge.first_statement_period, billing_period_norm)
         if installment_number is None or installment_number > charge.installments:
@@ -304,7 +333,7 @@ def _remaining_committed(charge: CreditCardCharge, current_open_billing_period: 
     return sum(schedule[min(already_closed, len(schedule)):], Decimal("0"))
 
 
-def _real_remaining_principal(db, card: CreditCard, current_open_billing_period: date) -> Optional[Decimal]:
+def _real_remaining_principal(db: Session, card: CreditCard, current_open_billing_period: date) -> Optional[Decimal]:
     """The bank's own reported "SALDO CAPITAL CUOTAS" (see
     CreditCardStatement.remaining_principal_installments) from the REAL
     statement of the cycle that most recently closed -- i.e. the cycle
@@ -318,17 +347,13 @@ def _real_remaining_principal(db, card: CreditCard, current_open_billing_period:
     the caller falls back to the projected estimate either way.
     """
     previous_cycle = _shift_months(current_open_billing_period, -1)
-    statement = (
-        db.query(CreditCardStatement)
-        .filter(CreditCardStatement.credit_card_id == card.id, CreditCardStatement.billing_period == previous_cycle)
-        .first()
-    )
+    statement = _find_statement(db, card.id, previous_cycle)
     if statement is None:
         return None
     return statement.remaining_principal_installments
 
 
-def _cupo_disponible_detail(db, card: CreditCard, today: date) -> Tuple[Decimal, bool]:
+def _cupo_disponible_detail(db: Session, card: CreditCard, today: date) -> Tuple[Decimal, bool]:
     """(cupo_disponible, is_estimate). credit_limit menos el saldo
     comprometido -- real si el banco ya reportó "SALDO CAPITAL CUOTAS" para
     el ciclo que acaba de cerrar (is_estimate=False), o si no, una
@@ -345,11 +370,7 @@ def _cupo_disponible_detail(db, card: CreditCard, today: date) -> Tuple[Decimal,
     nunca ocultarse.
     """
     current_open = _current_open_billing_period(card, today)
-    charges = (
-        db.query(CreditCardCharge)
-        .filter(CreditCardCharge.credit_card_id == card.id, CreditCardCharge.first_statement_period.isnot(None))
-        .all()
-    )
+    charges = _active_charges(db, card.id)
 
     real = _real_remaining_principal(db, card, current_open)
     if real is not None:
@@ -373,14 +394,16 @@ def _cupo_disponible_detail(db, card: CreditCard, today: date) -> Tuple[Decimal,
     return Decimal(str(card.credit_limit)) - committed, True
 
 
-def cupo_disponible(db, card: CreditCard, today: date) -> Decimal:
+def cupo_disponible(db: Session, card: CreditCard, today: date) -> Decimal:
     """See _cupo_disponible_detail -- this is the value-only convenience
     wrapper kept for callers (and tests) that don't need to know whether the
     figure is real or estimated."""
     return _cupo_disponible_detail(db, card, today)[0]
 
 
-def _is_last_statement_paid(db, card: CreditCard, previous_cycle: date, statement: Optional[CreditCardStatement]) -> bool:
+def _is_last_statement_paid(
+    db: Session, card: CreditCard, previous_cycle: date, statement: Optional[CreditCardStatement],
+) -> bool:
     """Whether `previous_cycle`'s bill has actually been paid, per the
     mapped sheet row's own real layer (SheetCell.paid_value, written by
     `record set`/sync_period) -- the SAME source of truth `available`/
@@ -409,7 +432,7 @@ def _is_last_statement_paid(db, card: CreditCard, previous_cycle: date, statemen
 
 
 def _cupo_disponible_real_ahora(
-    db, card: CreditCard, today: date, *, exclude_category: Optional[str] = None,
+    db: Session, card: CreditCard, today: date, *, exclude_category: Optional[str] = None,
 ) -> Tuple[Decimal, bool]:
     """(cupo_disponible_real_ahora, is_estimate): what the bank's own app
     would show for this card RIGHT NOW -- deliberately different from
@@ -434,20 +457,12 @@ def _cupo_disponible_real_ahora(
     """
     current_open = _current_open_billing_period(card, today)
     previous_cycle = _shift_months(current_open, -1)
-    statement = (
-        db.query(CreditCardStatement)
-        .filter(CreditCardStatement.credit_card_id == card.id, CreditCardStatement.billing_period == previous_cycle)
-        .first()
-    )
+    statement = _find_statement(db, card.id, previous_cycle)
     unpaid_last_bill = Decimal("0")
     if statement is not None and not _is_last_statement_paid(db, card, previous_cycle, statement):
         unpaid_last_bill = statement.total_payment_due
 
-    charges = (
-        db.query(CreditCardCharge)
-        .filter(CreditCardCharge.credit_card_id == card.id, CreditCardCharge.first_statement_period.isnot(None))
-        .all()
-    )
+    charges = _active_charges(db, card.id)
     new_real_charges = sum(
         (_remaining_committed(c, current_open) for c in charges
          if c.first_statement_period >= current_open and (exclude_category is None or c.category != exclude_category)),
@@ -483,58 +498,14 @@ class SyncReport:
     dry_run: bool = False
 
 
-def _get_or_create_cell(db, row_id: int, period_id: int) -> SheetCell:
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row_id, SheetCell.period_id == period_id).first()
-    if not cell:
-        cell = SheetCell(row_id=row_id, period_id=period_id)
-        db.add(cell)
-        db.flush()
-    return cell
-
-
-def _supersede_and_write_override(
-    db, cell: SheetCell, value: Decimal, note: str, created_by: int,
-) -> Optional[CellOverride]:
-    """Supersede the cell's active override (if any) and insert a new
-    manual_value one. Returns the superseded override (or None) so the
-    caller can report its old value."""
-    previous = None
-    for ov in cell.overrides:
-        if ov.superseded_at is None:
-            previous = ov
-            break
-    if previous is not None:
-        previous.superseded_at = datetime.utcnow()
-        db.flush()
-
-    db.add(CellOverride(cell_id=cell.id, value=value, override_type="manual_value", note=note, created_by=created_by))
-    db.flush()
-    return previous
-
-
-def _sync_period_write(
-    db,
-    card: CreditCard,
-    sheet: Optional[CashflowSheet],
-    row: Optional[SheetRow],
-    period: date,
-    acting_user_id: int,
-) -> SyncReport:
-    """Everything sync_period() does EXCEPT deciding dry_run/commit --
-    factored out so a caller that's already managing its own open
-    transaction across several writes (e.g. a multi-period draw preview
-    that syncs a drawn card's future bill mid-loop, all inside one outer
-    preview transaction) can reuse this exact write logic without
-    sync_period's own commit()/rollback() firing early and discarding
-    everything else already written in that same session. See
-    sync_period's own docstring for what this actually writes -- unchanged,
-    just without the transaction-boundary decision at the end. Returns a
-    SyncReport with dry_run left at its dataclass default (False); the
-    caller is responsible for setting it to whatever's actually true before
-    showing it to anyone.
-    """
-    period_norm = date(period.year, period.month, 1)
-
+def _resolve_sync_target(
+    db: Session, card: CreditCard, sheet: Optional[CashflowSheet], row: Optional[SheetRow], period_norm: date,
+) -> Tuple[CashflowSheet, SheetRow, SheetPeriod]:
+    """Resolve the (sheet, row, period) sync_period actually writes to,
+    falling back to the card's own mapped_sheet_id/mapped_row_id when the
+    caller doesn't pass one explicitly. Raises ValueError on any of: no
+    mapping at all, a mapped sheet/row that no longer exists, a row that
+    doesn't belong to the resolved sheet, or no period for this month."""
     sheet_id = sheet.id if sheet is not None else card.mapped_sheet_id
     row_id = row.id if row is not None else card.mapped_row_id
     if sheet_id is None or row_id is None:
@@ -577,49 +548,98 @@ def _sync_period_write(
         raise ValueError(
             f"La planilla #{sheet_obj.id} no tiene un período para {period_norm.strftime('%Y-%m')}."
         )
+    return sheet_obj, row_obj, sheet_period
+
+
+def _write_real_statement_branch(
+    db: Session, card: CreditCard, row_obj: SheetRow, sheet_period: SheetPeriod,
+    real_statement: CreditCardStatement, *, billing_label: str, period_label: str, lag: int, acting_user_id: int,
+) -> Tuple[Optional[Decimal], Decimal, str]:
+    """Write branch: a real CreditCardStatement already exists for this
+    cycle -- record its total_payment_due as accrued. Returns (old_value,
+    new_value, note)."""
+    cell = get_or_create_cell(db, row_obj.id, sheet_period.id)
+    old_value = cell.accrued_value
+    new_value = real_statement.total_payment_due
+    note = (
+        f"creditcard_statements.sync_period: total a pagar del estado de cuenta real de "
+        f"'{card.name}' que cerró {billing_label} (estado #{real_statement.id}), pagadero en "
+        f"{period_label} (desfase de {lag} mes(es) entre cierre y pago)."
+    )
+    cell.accrued_value = new_value
+    db.add(CellActualEntry(
+        cell_id=cell.id,
+        actual_value=cell.actual_value,
+        accrued_value=cell.accrued_value,
+        paid_value=cell.paid_value,
+        note=note,
+        created_by=acting_user_id,
+    ))
+    db.flush()
+    return old_value, new_value, note
+
+
+def _write_projection_branch(
+    db: Session, card: CreditCard, row_obj: SheetRow, sheet_period: SheetPeriod, period_norm: date, *,
+    billing_label: str, period_label: str, acting_user_id: int,
+) -> Tuple[Optional[Decimal], Decimal, str]:
+    """Write branch: no real statement yet for this cycle -- project from
+    active charges and write it as an overridable projection. Returns
+    (old_value, new_value, note)."""
+    instant = compute_instant_statement(db, card, period_norm)
+    cell = get_or_create_cell(db, row_obj.id, sheet_period.id)
+    new_value = instant.charges_due_this_cycle
+    note = (
+        f"creditcard_statements.sync_period: proyección de cargos activos de '{card.name}' para "
+        f"el ciclo que cierra {billing_label}, pagadero en {period_label} (todavía no hay estado "
+        f"de cuenta real registrado para ese ciclo)."
+    )
+    previous = supersede_and_write_override(db, cell, new_value, created_by=acting_user_id, note=note)
+    old_value = previous.value if previous is not None else None
+    return old_value, new_value, note
+
+
+def _sync_period_write(
+    db: Session,
+    card: CreditCard,
+    sheet: Optional[CashflowSheet],
+    row: Optional[SheetRow],
+    period: date,
+    acting_user_id: int,
+) -> SyncReport:
+    """Everything sync_period() does EXCEPT deciding dry_run/commit --
+    factored out so a caller that's already managing its own open
+    transaction across several writes (e.g. a multi-period draw preview
+    that syncs a drawn card's future bill mid-loop, all inside one outer
+    preview transaction) can reuse this exact write logic without
+    sync_period's own commit()/rollback() firing early and discarding
+    everything else already written in that same session. See
+    sync_period's own docstring for what this actually writes -- unchanged,
+    just without the transaction-boundary decision at the end. Returns a
+    SyncReport with dry_run left at its dataclass default (False); the
+    caller is responsible for setting it to whatever's actually true before
+    showing it to anyone.
+    """
+    period_norm = date(period.year, period.month, 1)
+    sheet_obj, row_obj, sheet_period = _resolve_sync_target(db, card, sheet, row, period_norm)
 
     period_label = period_norm.strftime("%Y-%m")
     lag = _payment_lag_months(card)
     billing_period_norm = _shift_months(period_norm, -lag)
     billing_label = billing_period_norm.strftime("%Y-%m")
 
-    real_statement = (
-        db.query(CreditCardStatement)
-        .filter(CreditCardStatement.credit_card_id == card.id, CreditCardStatement.billing_period == billing_period_norm)
-        .first()
-    )
-
+    real_statement = _find_statement(db, card.id, billing_period_norm)
     if real_statement is not None:
-        cell = _get_or_create_cell(db, row_obj.id, sheet_period.id)
-        old_value = cell.accrued_value
-        new_value = real_statement.total_payment_due
-        note = (
-            f"creditcard_statements.sync_period: total a pagar del estado de cuenta real de "
-            f"'{card.name}' que cerró {billing_label} (estado #{real_statement.id}), pagadero en "
-            f"{period_label} (desfase de {lag} mes(es) entre cierre y pago)."
+        old_value, new_value, note = _write_real_statement_branch(
+            db, card, row_obj, sheet_period, real_statement,
+            billing_label=billing_label, period_label=period_label, lag=lag, acting_user_id=acting_user_id,
         )
-        cell.accrued_value = new_value
-        db.add(CellActualEntry(
-            cell_id=cell.id,
-            actual_value=cell.actual_value,
-            accrued_value=cell.accrued_value,
-            paid_value=cell.paid_value,
-            note=note,
-            created_by=acting_user_id,
-        ))
-        db.flush()
         branch = "real_statement"
     else:
-        instant = compute_instant_statement(db, card, period_norm)
-        cell = _get_or_create_cell(db, row_obj.id, sheet_period.id)
-        new_value = instant.charges_due_this_cycle
-        note = (
-            f"creditcard_statements.sync_period: proyección de cargos activos de '{card.name}' para "
-            f"el ciclo que cierra {billing_label}, pagadero en {period_label} (todavía no hay estado "
-            f"de cuenta real registrado para ese ciclo)."
+        old_value, new_value, note = _write_projection_branch(
+            db, card, row_obj, sheet_period, period_norm,
+            billing_label=billing_label, period_label=period_label, acting_user_id=acting_user_id,
         )
-        previous = _supersede_and_write_override(db, cell, new_value, note, acting_user_id)
-        old_value = previous.value if previous is not None else None
         branch = "projection"
 
     return SyncReport(
@@ -636,7 +656,7 @@ def _sync_period_write(
 
 
 def sync_period(
-    db,
+    db: Session,
     card: CreditCard,
     sheet: Optional[CashflowSheet],
     row: Optional[SheetRow],

@@ -1,8 +1,25 @@
+"""Pydantic request/response DTOs mirroring the ORM models in models.py --
+Create/Update for input, Out for output, matching a typical HTTP-API-layer
+shape (row_type/sign/etc. use plain str here, not opencashflow.enums'
+Literal aliases, since these are meant to survive independently of the ORM
+column types they mirror).
+
+Nothing in this package or in opencashflow-cli calls into this module
+today -- it isn't wired into any HTTP framework, router, or endpoint. It's
+kept as a reserved starting point for a future API layer (e.g. serving a
+web client, as opposed to a native/CLI consumer that can import the core
+library's ORM models directly) rather than deleted, since its shapes are
+already most of what such a layer would need to define for itself. See
+test_schemas.py for coverage validating every schema here against a real
+ORM instance where one exists.
+"""
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, computed_field, model_validator
+
+from opencashflow.periods import is_same_month
 
 
 # ---------------------------------------------------------------------------
@@ -104,25 +121,16 @@ class PeriodOut(BaseModel):
     period_date: datetime
     label: Optional[str]
     is_closed: bool
-    is_current: bool
     sort_order: int
 
     model_config = {"from_attributes": True}
 
-    @model_validator(mode="before")
-    @classmethod
-    def compute_is_current(cls, data: Any) -> Any:
-        """is_current is computed dynamically: true when period_date is in the current month."""
-        if hasattr(data, "__dict__"):
-            period_date: Optional[datetime] = getattr(data, "period_date", None)
-            if period_date is not None:
-                today = datetime.utcnow()
-                object.__setattr__(
-                    data,
-                    "_is_current",
-                    period_date.year == today.year and period_date.month == today.month,
-                )
-        return data
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def is_current(self) -> bool:
+        """True when period_date is in the current month, computed dynamically
+        rather than stored -- "now" is meaningless to persist on a row."""
+        return is_same_month(self.period_date, datetime.utcnow())
 
 
 class PeriodOutSimple(BaseModel):
@@ -140,8 +148,7 @@ class PeriodOutSimple(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def is_current(self) -> bool:
-        today = datetime.utcnow()
-        return self.period_date.year == today.year and self.period_date.month == today.month
+        return is_same_month(self.period_date, datetime.utcnow())
 
 
 # ---------------------------------------------------------------------------

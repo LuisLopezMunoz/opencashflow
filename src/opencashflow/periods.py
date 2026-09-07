@@ -9,6 +9,11 @@ from opencashflow.models import CashflowSheet, SheetPeriod
 
 def generate_periods(sheet: CashflowSheet, db: Session) -> None:
     """Create SheetPeriod rows for each month in the sheet's horizon."""
+    if sheet.horizon_months <= 0:
+        raise ValueError(
+            f"horizon_months debe ser positivo, se recibió {sheet.horizon_months} -- "
+            f"una planilla con 0 o menos meses de horizonte no puede tener períodos."
+        )
     base = sheet.base_period
     year, month = base.year, base.month
     for i in range(sheet.horizon_months):
@@ -53,6 +58,8 @@ def extend_periods_backward(sheet: CashflowSheet, months: int, db: Session) -> L
     Does not create SheetCell rows — cells are always materialized on
     demand, same as everywhere else in this package.
     """
+    if months <= 0:
+        raise ValueError(f"months debe ser positivo, se recibió {months}.")
     existing = sorted(sheet.periods, key=lambda p: p.sort_order)
     if not existing:
         raise ValueError("Sheet has no periods yet — call generate_periods() first.")
@@ -87,6 +94,15 @@ def extend_periods_backward(sheet: CashflowSheet, months: int, db: Session) -> L
     return created
 
 
+def is_same_month(a: datetime, b: datetime) -> bool:
+    """True when `a` and `b` fall in the same calendar month/year -- the one
+    comparison every "is this period the current one" check in this package
+    actually needs, previously reimplemented independently in three places
+    (this function's own former inline version, schemas.PeriodOut, and
+    schemas.PeriodOutSimple)."""
+    return a.year == b.year and a.month == b.month
+
+
 def find_anchor_period(periods: List[SheetPeriod], today: Optional[datetime] = None) -> Optional[SheetPeriod]:
     """Pick the period to treat as "now" for relative period-window views
     (e.g. show --before/--after/--context).
@@ -102,7 +118,7 @@ def find_anchor_period(periods: List[SheetPeriod], today: Optional[datetime] = N
         today = datetime.utcnow()
     ordered = sorted(periods, key=lambda p: p.sort_order)
     for p in ordered:
-        if p.period_date.year == today.year and p.period_date.month == today.month:
+        if is_same_month(p.period_date, today):
             return p
     for p in ordered:
         if p.period_date > today:

@@ -40,8 +40,50 @@ def _dates(periods):
 
 
 # ---------------------------------------------------------------------------
+# generate_periods -- this file's docstring used to call this coverage
+# "smoke only" (it's exercised only indirectly, via the _make_sheet
+# fixture every other test here uses). This is the direct assertion of its
+# actual (period_date, label, sort_order) output, including the modular
+# year-rollover arithmetic ((month - 1 + i) % 12 + 1 / year + (month - 1 +
+# i) // 12) an off-by-one could silently break without any test noticing.
+# ---------------------------------------------------------------------------
+
+def test_generate_periods_exact_output_across_a_year_boundary(db):
+    sheet = CashflowSheet(user_id=TEST_USER_ID, name="Boundary", currency="CLP",
+                           horizon_months=4, base_period=datetime(2026, 11, 1))
+    db.add(sheet)
+    db.flush()
+    generate_periods(sheet, db)
+    db.commit()
+
+    periods = sorted(sheet.periods, key=lambda p: p.sort_order)
+    assert [(p.period_date, p.label, p.sort_order) for p in periods] == [
+        (datetime(2026, 11, 1), "Nov 2026", 0),
+        (datetime(2026, 12, 1), "Dec 2026", 1),
+        (datetime(2027, 1, 1), "Jan 2027", 2),
+        (datetime(2027, 2, 1), "Feb 2027", 3),
+    ]
+
+
+def test_generate_periods_rejects_non_positive_horizon(db):
+    for bad_horizon in (0, -1):
+        sheet = CashflowSheet(user_id=TEST_USER_ID, name="Bad Horizon", currency="CLP",
+                               horizon_months=bad_horizon, base_period=datetime(2026, 1, 1))
+        db.add(sheet)
+        db.flush()
+        with pytest.raises(ValueError, match="horizon_months"):
+            generate_periods(sheet, db)
+
+
+# ---------------------------------------------------------------------------
 # extend_periods_backward
 # ---------------------------------------------------------------------------
+
+def test_extend_periods_backward_rejects_non_positive_months(db):
+    sheet = _make_sheet(db, months=1)
+    for bad_months in (0, -1):
+        with pytest.raises(ValueError, match="months"):
+            extend_periods_backward(sheet, months=bad_months, db=db)
 
 def test_extend_periods_backward_creates_contiguous_history(db):
     sheet = _make_sheet(db, months=2, base_period=datetime(2026, 9, 1))  # Sep, Oct 2026

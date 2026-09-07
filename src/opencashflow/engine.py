@@ -99,17 +99,15 @@ Cycle detection:
   participating in a cycle with error='cycle_detected'.
 """
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import Decimal
+from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
+from opencashflow.enums import ROW_SIGNS
 from opencashflow.models import CashflowSheet, SheetCell, SheetPeriod, SheetRow, SheetSection
-
-MAX_DEPENDENCY_DEPTH = 20
 
 
 class EffectiveSource(str, Enum):
@@ -117,6 +115,33 @@ class EffectiveSource(str, Enum):
     RULE = "rule"
     LEDGER = "ledger"
     EMPTY = "empty"
+
+
+# Matches every SheetCell money column's Numeric(14, 2) type. Every
+# currency in actual use in this codebase (CLP, USD) is 2-decimal in this
+# system's own convention -- deriving a per-currency minor-unit count (0 for
+# JPY, 3 for BHD/KWD, ...) would need its own lookup table for currencies
+# nothing here uses today; not worth building speculatively. If that ever
+# changes, this is the one constant to make currency-dependent.
+CELL_VALUE_PRECISION = Decimal("0.01")
+
+
+def _quantize(value: Optional[Decimal]) -> Optional[Decimal]:
+    """Round a projected value to CELL_VALUE_PRECISION at the single point
+    it leaves rule evaluation and becomes visible to every downstream rule
+    reading `computed` (sum_rows, percent_of_row, previous_period,
+    rolling_average all read values other rows already resolved).
+
+    Without this, a value like rolling_average's division can carry the
+    full ~28-digit Decimal-context precision through every dependent
+    calculation with no rounding at all -- currently masked because SQLite
+    (used throughout this test suite) doesn't enforce a Numeric(14,2)
+    column's precision/scale the way a real deployment's database would,
+    so this was previously untested end-to-end.
+    """
+    if value is None:
+        return None
+    return value.quantize(CELL_VALUE_PRECISION, rounding=ROUND_HALF_UP)
 
 
 @dataclass
@@ -350,6 +375,16 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
     value_overrides supplies ephemeral scenario values keyed by (row_id, period_id).
     They propagate through dependent rules without writing cells or audit entries.
 
+    KNOWN FUTURE REFACTOR (not done here): this function mixes DB I/O (the
+    queries at the top) with pure computation (the topo-sort/evaluation
+    loop below), which is why every test of the pure evaluation logic in
+    test_engine_rules.py has to go through a full SQLite round-trip instead
+    of plain Python fixtures. Splitting it into a data-loading stage and a
+    pure evaluate(rows, periods, rules, cells) function would fix that, but
+    it's a real restructuring of the engine's central function with no bug
+    behind it -- left as a dedicated future refactor once the correctness
+    fixes made alongside this docstring update have had time to prove out.
+
     Returns a dict with structure:
     {
         "sheet": <CashflowSheet ORM object>,
@@ -389,6 +424,7 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
     )
 
     # Collect all row ids across all sections
+    rows_by_section: Dict[int, List[SheetRow]] = {}
     all_rows: List[SheetRow] = []
     for section in sections:
         rows = (
@@ -397,6 +433,7 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
             .order_by(SheetRow.sort_order)
             .all()
         )
+        rows_by_section[section.id] = rows
         all_rows.extend(rows)
 
     row_map: Dict[int, SheetRow] = {r.id: r for r in all_rows}
@@ -477,6 +514,17 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
             adjacency[row.id] = [d for d in deps if d in row_map]
     # Also consider manual_rule overrides that override the row-level rule
     # For simplicity, also scan per-cell rules; the union is what matters for cycle detection
+    #
+    # INTENTIONAL SIMPLIFICATION, not a bug: this unions every period's
+    # effective rule into ONE row-level adjacency graph, so cyclic_rows (and
+    # therefore error="cycle_detected") is a per-ROW verdict, not a per-CELL
+    # one. If a manual_rule override introduces a cycle in only ONE period,
+    # every period of that row gets marked cycle_detected -- including
+    # periods where the row's own default rule has no cycle at all. Building
+    # a genuinely per-period adjacency graph (only when per-cell manual_rule
+    # overrides are present) would fix this, but adds real graph-construction
+    # complexity for a case that's plausible but has not been reproduced as
+    # an actual problem -- not worth it unless it becomes one.
     for (row_id, period_id), rule in effective_rules.items():
         if rule and (row_id, period_id) not in effective_manual:
             deps = _extract_same_period_deps(rule)
@@ -497,12 +545,21 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
         visited: Set[int] = set()
         order: List[int] = []
 
-        def visit(node: int, depth: int = 0) -> None:
-            if node in visited or depth > MAX_DEPENDENCY_DEPTH:
+        def visit(node: int) -> None:
+            # `visited` alone makes this DFS terminate on any finite graph --
+            # cycles are stripped out of `rows`/`adj` before this runs (see
+            # cyclic_rows below), so there is nothing left for a depth cap to
+            # guard against. A depth cap used to sit here (MAX_DEPENDENCY_DEPTH
+            # = 20): past that many hops it silently stopped the traversal
+            # mid-chain WITHOUT marking the cut-off nodes as visited, so a
+            # dependency chain deeper than 20 rows had its tail evaluated out
+            # of order later and resolved to None with no error at all --
+            # indistinguishable from a legitimately empty cell.
+            if node in visited:
                 return
             visited.add(node)
             for neighbor in adj.get(node, []):
-                visit(neighbor, depth + 1)
+                visit(neighbor)
             order.append(node)
 
         for rid in rows:
@@ -519,7 +576,7 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
         for row_id in topo_order:
             key = (row_id, period.id)
             if key in effective_manual:
-                val = effective_manual[key]
+                val = _quantize(effective_manual[key])
                 computed[key] = val
                 results_by_row_period[key] = CellResult(
                     row_id=row_id,
@@ -540,15 +597,32 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
                         **_real_fields(cell_map.get(key), None),
                     )
                 else:
-                    val, source, rule_error = _evaluate_rule(
-                        rule=rule,
-                        row_id=row_id,
-                        period_id=period.id,
-                        sorted_period_ids=sorted_period_ids,
-                        computed=computed,
-                        row_signs=row_signs,
-                        real_pending=real_pending,
-                    )
+                    try:
+                        val, source, rule_error = _evaluate_rule(
+                            rule=rule,
+                            row_id=row_id,
+                            period_id=period.id,
+                            sorted_period_ids=sorted_period_ids,
+                            computed=computed,
+                            row_signs=row_signs,
+                            real_pending=real_pending,
+                        )
+                    except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                        # A malformed rule VALUE (as opposed to an unsupported
+                        # rule TYPE, which _evaluate_rule already handles by
+                        # returning an error tuple) used to propagate straight
+                        # out of compute_sheet and crash the computation of
+                        # the WHOLE sheet -- e.g. {"type": "constant", "value":
+                        # "not-a-number"} raised decimal.InvalidOperation with
+                        # no per-cell error, taking every other cell down with
+                        # it. Isolate the failure to this one cell instead,
+                        # consistent with the unsupported_rule:<type> error
+                        # already used for the sibling "bad rule type" case.
+                        val, source, rule_error = (
+                            None, EffectiveSource.EMPTY,
+                            f"invalid_rule_value:{rule.get('type', 'empty')}",
+                        )
+                    val = _quantize(val)
                     computed[key] = val
                     results_by_row_period[key] = CellResult(
                         row_id=row_id,
@@ -575,17 +649,12 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
                 **_real_fields(cell_map.get(key), None),
             )
 
-    # Assemble final structure
+    # Assemble final structure. Reuses rows_by_section (built earlier from
+    # the same query) instead of re-querying the same rows a second time.
     result_sections = []
     for section in sections:
-        section_rows = (
-            db.query(SheetRow)
-            .filter(SheetRow.section_id == section.id)
-            .order_by(SheetRow.sort_order)
-            .all()
-        )
         row_outputs = []
-        for row in section_rows:
+        for row in rows_by_section[section.id]:
             cells = [
                 results_by_row_period.get(
                     (row.id, period.id),
@@ -622,7 +691,16 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
 # ---------------------------------------------------------------------------
 
 def row_sign_multiplier(row: SheetRow) -> int:
-    """+1 for row.sign == "positive", -1 otherwise ("negative")."""
+    """+1 for row.sign == "positive", -1 for row.sign == "negative".
+
+    Raises ValueError on anything else. This used to silently fall through
+    to -1 for ANY non-"positive" value -- a typo, None, or a value from a
+    database written before SheetRow.sign gained its @validates guard would
+    flip the sign of every total/subtotal built on top of this row with no
+    exception anywhere in the chain. Now it fails loudly instead.
+    """
+    if row.sign not in ROW_SIGNS:
+        raise ValueError(f"row.sign debe ser uno de {ROW_SIGNS}, se recibió {row.sign!r}")
     return 1 if row.sign == "positive" else -1
 
 

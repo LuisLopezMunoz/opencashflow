@@ -16,48 +16,27 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 from opencashflow.engine import compute_sheet
+from opencashflow.enums import AGGREGATE_ROW_TYPES
 from opencashflow.models import (
     CashflowSheet,
     CellActualEntry,
-    CellOverride,
-    SheetCell,
     SheetPeriod,
     SheetRow,
     SheetSection,
+    get_or_create_cell,
+    supersede_and_write_override,
 )
-
-# Row types that are sums of other rows, never a real per-row obligation of
-# their own -- excluded from "what's pending this period".
-AGGREGATE_ROW_TYPES = {"subtotal", "total", "running_balance", "label", "separator"}
 
 
 def _period_label(period: SheetPeriod) -> str:
     return period.label or period.period_date.strftime("%b-%y")
 
 
-def _get_or_create_cell(db, row_id: int, period_id: int) -> SheetCell:
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row_id, SheetCell.period_id == period_id).first()
-    if not cell:
-        cell = SheetCell(row_id=row_id, period_id=period_id)
-        db.add(cell)
-        db.flush()
-    return cell
-
-
-def _supersede_active_override(db, cell_id: int) -> bool:
-    """Mark the active (superseded_at is None) override on this cell, if
-    any, as superseded. Returns True iff one existed (caller uses this to
-    pick the right disposition string)."""
-    existing = (
-        db.query(CellOverride)
-        .filter(CellOverride.cell_id == cell_id, CellOverride.superseded_at.is_(None))
-        .first()
-    )
-    if existing:
-        existing.superseded_at = datetime.utcnow()
-        db.flush()
-        return True
-    return False
+def _next_calendar_month(period_date: datetime) -> datetime:
+    """The 1st of the calendar month immediately after `period_date`."""
+    if period_date.month == 12:
+        return datetime(period_date.year + 1, 1, 1)
+    return datetime(period_date.year, period_date.month + 1, 1)
 
 
 def find_balance_row(db, sheet_id: int) -> SheetRow:
@@ -100,7 +79,26 @@ def _real_value(row_id: int, period_id: int, row_by_id: Dict[int, SheetRow],
     actual, else 0) instead of its projected_value, applying sign once per
     sum_rows level exactly like engine._evaluate_rule's own sum_rows branch
     does for projected numbers.
+
+    Raises ValueError if `row_id` is part of a dependency cycle. This walk
+    used to recurse into sum_rows with no cycle protection of its own,
+    unlike compute_sheet (which detects cycles up front and marks every
+    participating cell error="cycle_detected"); a cyclic sheet close_period
+    could compute fine on the projected side used to crash with an unhandled
+    RecursionError here, on the real side, violating this module's own
+    documented "only ever raises ValueError" contract. Checking cr.error
+    reuses compute_sheet's already-cycle-safe result instead of re-detecting
+    cycles independently.
     """
+    cr = cell_result_by_key.get((row_id, period_id))
+    if cr is not None and cr.error == "cycle_detected":
+        row = row_by_id.get(row_id)
+        row_label = row.name if row else f"#{row_id}"
+        raise ValueError(
+            f"Cannot close this period: row '{row_label}' has a dependency cycle "
+            f"(cycle_detected) in its projection rule -- fix the sheet's sum_rows "
+            f"rules before closing."
+        )
     row = row_by_id.get(row_id)
     rule = row.default_projection_rule if row else None
     if rule and rule.get("type") == "sum_rows":
@@ -112,7 +110,6 @@ def _real_value(row_id: int, period_id: int, row_by_id: Dict[int, SheetRow],
             sign = -1 if dep_row.sign == "negative" else 1
             total += sign * _real_value(dep_id, period_id, row_by_id, cell_result_by_key)
         return total
-    cr = cell_result_by_key.get((row_id, period_id))
     if cr is None:
         return Decimal("0")
     if cr.paid_value is not None:
@@ -268,114 +265,128 @@ def close_period(
     warnings: List[str] = []
     pending_by_row: List[Tuple[SheetRow, Decimal]] = []
 
-    for row_id, row in row_by_id.items():
-        if row.row_type in AGGREGATE_ROW_TYPES or row_id in excluded_row_ids:
-            continue
-        cr = cell_result_by_key.get((row_id, period.id))
-        if cr is None:
-            continue
+    # --- Write phase. Every guard above this point has already passed, so
+    # from here on this function is actually mutating the session -- wrapped
+    # in try/except so an unexpected failure partway through (a constraint
+    # violation, a bug in a helper) leaves the database exactly as it was
+    # before this call started, instead of a half-applied close. -----------
+    try:
+        for row_id, row in row_by_id.items():
+            if row.row_type in AGGREGATE_ROW_TYPES or row_id in excluded_row_ids:
+                continue
+            cr = cell_result_by_key.get((row_id, period.id))
+            if cr is None:
+                continue
 
-        accrued = cr.accrued_value
-        paid = cr.paid_value
-        projected = cr.projected_value
+            accrued = cr.accrued_value
+            paid = cr.paid_value
+            projected = cr.projected_value
 
-        if accrued is not None and paid is not None:
-            pending_for_close = max(Decimal("0"), accrued - paid)
-        elif accrued is not None:
-            pending_for_close = accrued
-        elif projected not in (None, 0):
-            if assume_unrecorded_as_pending:
-                pending_for_close = projected
-                cell = _get_or_create_cell(db, row_id, period.id)
-                cell.accrued_value = projected
-                cell.paid_value = Decimal("0")
-                db.add(CellActualEntry(
-                    cell_id=cell.id,
-                    actual_value=cell.actual_value,
-                    accrued_value=cell.accrued_value,
-                    paid_value=cell.paid_value,
-                    note=(
-                        f"period_close: no data recorded for {period_label}, assumed fully "
-                        f"pending (projection {projected})."
-                    ),
-                    created_by=acting_user_id,
-                ))
-                db.flush()
+            if accrued is not None and paid is not None:
+                pending_for_close = max(Decimal("0"), accrued - paid)
+            elif accrued is not None:
+                pending_for_close = accrued
+            elif projected not in (None, 0):
+                if assume_unrecorded_as_pending:
+                    pending_for_close = projected
+                    cell = get_or_create_cell(db, row_id, period.id)
+                    cell.accrued_value = projected
+                    cell.paid_value = Decimal("0")
+                    db.add(CellActualEntry(
+                        cell_id=cell.id,
+                        actual_value=cell.actual_value,
+                        accrued_value=cell.accrued_value,
+                        paid_value=cell.paid_value,
+                        note=(
+                            f"period_close: no data recorded for {period_label}, assumed fully "
+                            f"pending (projection {projected})."
+                        ),
+                        created_by=acting_user_id,
+                    ))
+                    db.flush()
+                else:
+                    pending_for_close = Decimal("0")
+                    warnings.append(row.name)
             else:
                 pending_for_close = Decimal("0")
-                warnings.append(row.name)
-        else:
-            pending_for_close = Decimal("0")
 
-        if pending_for_close > 0:
-            pending_by_row.append((row, pending_for_close))
+            if pending_for_close > 0:
+                pending_by_row.append((row, pending_for_close))
 
-    real_net_flow = Decimal("0")
-    for dep_id in net_flow_row_ids:
-        dep_row = row_by_id.get(dep_id)
-        if dep_row is None:
-            continue
-        sign = -1 if dep_row.sign == "negative" else 1
-        real_net_flow += sign * _real_value(dep_id, period.id, row_by_id, cell_result_by_key)
-    saldo_final_value = saldo_inicial_value + real_net_flow
+        real_net_flow = Decimal("0")
+        for dep_id in net_flow_row_ids:
+            dep_row = row_by_id.get(dep_id)
+            if dep_row is None:
+                continue
+            sign = -1 if dep_row.sign == "negative" else 1
+            real_net_flow += sign * _real_value(dep_id, period.id, row_by_id, cell_result_by_key)
+        saldo_final_value = saldo_inicial_value + real_net_flow
 
-    # --- Write the real ending balance for this period. --------------------
-    balance_final_cell = _get_or_create_cell(db, balance_final_row.id, period.id)
-    _supersede_active_override(db, balance_final_cell.id)
-    db.add(CellOverride(
-        cell_id=balance_final_cell.id,
-        value=saldo_final_value,
-        override_type="manual_value",
-        note=f"period_close: real ending balance for {period_label}",
-        created_by=acting_user_id,
-    ))
-    db.flush()
+        # --- Write the real ending balance for this period. ----------------
+        balance_final_cell = get_or_create_cell(db, balance_final_row.id, period.id)
+        supersede_and_write_override(
+            db, balance_final_cell, saldo_final_value, created_by=acting_user_id,
+            note=f"period_close: real ending balance for {period_label}",
+        )
 
-    # --- Roll unpaid amounts forward onto the next period. -----------------
-    next_period = (
-        db.query(SheetPeriod)
-        .filter(SheetPeriod.sheet_id == sheet.id, SheetPeriod.sort_order == period.sort_order + 1)
-        .first()
-    )
-    next_period_label = _period_label(next_period) if next_period else None
+        # --- Roll unpaid amounts forward onto the next period. Looked up by
+        # calendar date (the next calendar month), not sort_order + 1: a gap
+        # in sort_order (a manually-edited sheet, a partial backfill) used to
+        # make this behave exactly like "no next period" even when a
+        # chronologically-adjacent period actually existed elsewhere. -------
+        next_period_date = _next_calendar_month(period.period_date)
+        next_period = (
+            db.query(SheetPeriod)
+            .filter(SheetPeriod.sheet_id == sheet.id, SheetPeriod.period_date == next_period_date)
+            .first()
+        )
+        next_period_label = _period_label(next_period) if next_period else None
 
-    rollovers: List[RolloverEntry] = []
-    for row, pending in pending_by_row:
-        rule = row.default_projection_rule
-        if rule and rule.get("type") == "carry_forward":
-            rollovers.append(RolloverEntry(row.name, pending, "auto (carry_forward rule)"))
-            continue
+        rollovers: List[RolloverEntry] = []
+        for row, pending in pending_by_row:
+            rule = row.default_projection_rule
+            if rule and rule.get("type") == "carry_forward":
+                rollovers.append(RolloverEntry(row.name, pending, "auto (carry_forward rule)"))
+                continue
 
-        if next_period is None:
-            rollovers.append(
-                RolloverEntry(row.name, pending, "no next period (could not roll forward)")
+            if next_period is None:
+                rollovers.append(
+                    RolloverEntry(row.name, pending, "no next period (could not roll forward)")
+                )
+                # Also surfaced as a warning (not just buried in rollovers'
+                # free-text disposition) -- this pending amount is about to
+                # vanish from the system's persisted state entirely once
+                # this call returns, which is easy to miss otherwise.
+                warnings.append(
+                    f"{row.name}: {pending} pending with no next period to roll forward onto -- "
+                    f"this amount will not be tracked anywhere after this close."
+                )
+                continue
+
+            next_cr = cell_result_by_key.get((row.id, next_period.id))
+            base_next = next_cr.projected_value if next_cr else None
+            base_next_amt = base_next if base_next is not None else Decimal("0")
+            new_value = base_next_amt + pending
+
+            next_cell = get_or_create_cell(db, row.id, next_period.id)
+            replaced = supersede_and_write_override(
+                db, next_cell, new_value, created_by=acting_user_id,
+                note=(
+                    f"period_close: original projection {base_next_amt} + unpaid rollover "
+                    f"{pending} from {period_label}"
+                ),
             )
-            continue
+            disposition = (
+                "override written (replaced an existing override)" if replaced is not None else "override written"
+            )
+            rollovers.append(RolloverEntry(row.name, pending, disposition))
 
-        next_cr = cell_result_by_key.get((row.id, next_period.id))
-        base_next = next_cr.projected_value if next_cr else None
-        base_next_amt = base_next if base_next is not None else Decimal("0")
-        new_value = base_next_amt + pending
-
-        next_cell = _get_or_create_cell(db, row.id, next_period.id)
-        replaced = _supersede_active_override(db, next_cell.id)
-        db.add(CellOverride(
-            cell_id=next_cell.id,
-            value=new_value,
-            override_type="manual_value",
-            note=(
-                f"period_close: original projection {base_next_amt} + unpaid rollover "
-                f"{pending} from {period_label}"
-            ),
-            created_by=acting_user_id,
-        ))
+        # --- Mark the period closed and finish the transaction. ------------
+        period.is_closed = True
         db.flush()
-        disposition = "override written (replaced an existing override)" if replaced else "override written"
-        rollovers.append(RolloverEntry(row.name, pending, disposition))
-
-    # --- Mark the period closed and finish the transaction. ---------------
-    period.is_closed = True
-    db.flush()
+    except Exception:
+        db.rollback()
+        raise
 
     report = CloseReport(
         sheet_id=sheet.id,

@@ -3,6 +3,8 @@ two-pass import_sheet_spec/export_sheet_spec loader, and file I/O
 (load_sheet_spec/dump_sheet_spec/serialize_sheet_spec).
 """
 from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
 
 import pydantic
 import pytest
@@ -13,12 +15,18 @@ from opencashflow.engine import compute_sheet
 from opencashflow.models import Base
 from opencashflow.seed import seed_sheet
 from opencashflow.sheet_spec import (
+    RULE_SPEC_CLASSES,
     CarryForwardRuleSpec,
     ConstantRuleSpec,
+    PercentOfRowRuleSpec,
+    PreviousPeriodRuleSpec,
+    RollingAverageRuleSpec,
     SheetMetaSpec,
     SheetSpec,
+    SumRowsRuleSpec,
     dump_sheet_spec,
     export_sheet_spec,
+    find_unseeded_running_balance_rows,
     import_sheet_spec,
     load_sheet_spec,
     serialize_sheet_spec,
@@ -34,6 +42,58 @@ def db():
     session = sessionmaker(bind=engine)()
     yield session
     session.close()
+
+
+# ---------------------------------------------------------------------------
+# Parity across the three hand-rolled rule-type dispatches (see
+# RULE_SPEC_CLASSES's own comment in sheet_spec.py) -- one minimal instance
+# per rule class, run through all three, confirming none falls through to
+# its "unrecognized type" branch. A rule type added to one dispatch but not
+# the others would fail here instead of only at runtime on a specific cell.
+# ---------------------------------------------------------------------------
+
+_MINIMAL_RULE_INSTANCES = {
+    ConstantRuleSpec: ConstantRuleSpec(value=1),
+    PreviousPeriodRuleSpec: PreviousPeriodRuleSpec(row_id="X"),
+    SumRowsRuleSpec: SumRowsRuleSpec(row_ids=["X"]),
+    PercentOfRowRuleSpec: PercentOfRowRuleSpec(row_id="X", percent=10),
+    RollingAverageRuleSpec: RollingAverageRuleSpec(n=3),
+    CarryForwardRuleSpec: CarryForwardRuleSpec(base_rule=ConstantRuleSpec(value=1)),
+}
+
+
+def test_every_rule_spec_class_has_a_minimal_instance_for_the_parity_test():
+    # Guards the test fixture above itself against silently going stale if
+    # RULE_SPEC_CLASSES ever gains a member nobody added a case for here.
+    assert set(_MINIMAL_RULE_INSTANCES) == set(RULE_SPEC_CLASSES)
+
+
+@pytest.mark.parametrize("rule_cls", RULE_SPEC_CLASSES)
+def test_rule_dispatch_parity_forward_and_referenced_names(rule_cls):
+    from opencashflow.sheet_spec import _referenced_names, _resolve_rule_spec
+
+    rule = _MINIMAL_RULE_INSTANCES[rule_cls]
+    name_to_row = {"X": SimpleNamespace(id=1)}
+
+    resolved = _resolve_rule_spec(rule, name_to_row, "TestRow")
+    assert resolved["type"] == rule.type
+
+    # Must not raise for a resolvable reference (name_to_row has "X").
+    for name in _referenced_names(rule):
+        assert name in name_to_row
+
+
+@pytest.mark.parametrize("rule_cls", RULE_SPEC_CLASSES)
+def test_rule_dispatch_parity_reverse(rule_cls):
+    from opencashflow.sheet_spec import _reverse_resolve_rule, _resolve_rule_spec
+
+    rule = _MINIMAL_RULE_INSTANCES[rule_cls]
+    name_to_row = {"X": SimpleNamespace(id=1)}
+    id_to_name = {1: "X"}
+
+    resolved = _resolve_rule_spec(rule, name_to_row, "TestRow")
+    reversed_spec = _reverse_resolve_rule(resolved, id_to_name, "TestRow")
+    assert isinstance(reversed_spec, rule_cls)
 
 
 def _spec(**overrides):
@@ -197,6 +257,27 @@ def test_unresolvable_reference_nested_inside_carry_forward_base_rule(db):
         import_sheet_spec(db, spec, TEST_USER_ID)
 
 
+def test_failed_import_leaves_no_orphaned_sheet_in_the_session(db):
+    """import_sheet_spec used to db.add()/db.flush() the CashflowSheet (and
+    every section/row) BEFORE the duplicate-name/unresolvable-reference
+    checks that can raise -- a bad spec left a half-built, queryable
+    CashflowSheet in the session, since the ValueError path never called
+    db.rollback(). Now the pure-spec pre-validation runs before any db.add()
+    at all, so a failed import creates nothing to roll back in the first
+    place."""
+    from opencashflow.models import CashflowSheet
+
+    spec = _spec(sections=[{
+        "name": "Ingresos", "rows": [
+            {"name": "Ahorro", "rule": {"type": "percent_of_row", "row_id": "NoExiste", "percent": 10}},
+        ],
+    }])
+    with pytest.raises(ValueError, match="NoExiste"):
+        import_sheet_spec(db, spec, TEST_USER_ID)
+
+    assert db.query(CashflowSheet).count() == 0
+
+
 # ---------------------------------------------------------------------------
 # carry_forward nesting rejected at the Pydantic layer (defense in depth --
 # the engine's own runtime rejection is already covered by
@@ -309,3 +390,89 @@ def test_base_period_accepts_year_month():
 def test_base_period_rejects_garbage():
     with pytest.raises(pydantic.ValidationError):
         SheetMetaSpec(name="X", base_period="not-a-date")
+
+
+# ---------------------------------------------------------------------------
+# row_type/sign/section_type validation -- this file's Pydantic layer used to
+# be the WEAKEST of the three entry points into these columns (the CLI's
+# argparse choices= and the interactive wizard already validated them; a
+# hand-edited YAML/JSON sheet spec did not). A bad value here used to pass
+# straight through to the database and only surface, silently wrong, deep
+# inside engine.py (e.g. row_sign_multiplier/row.sign resolution).
+# ---------------------------------------------------------------------------
+
+def test_bad_row_type_rejected_at_import(db):
+    with pytest.raises(pydantic.ValidationError):
+        _spec(sections=[{"name": "S", "rows": [{"name": "A", "row_type": "subtotall"}]}])
+
+
+def test_bad_sign_rejected_at_import(db):
+    with pytest.raises(pydantic.ValidationError):
+        _spec(sections=[{"name": "S", "rows": [{"name": "A", "sign": "Positive"}]}])
+
+
+def test_bad_section_type_rejected_at_import(db):
+    with pytest.raises(pydantic.ValidationError):
+        _spec(sections=[{"name": "S", "section_type": "custome", "rows": []}])
+
+
+# ---------------------------------------------------------------------------
+# seed_value / find_unseeded_running_balance_rows -- a running_balance row
+# whose rule reads previous_period has nothing to read at period 1, so
+# without an explicit seed the whole projection used to be silently built
+# on an assumed starting balance of $0, with no error anywhere (confirmed
+# end-to-end against docs/examples/hogar-chileno.yaml, which now sets
+# seed_value on SALDO INICIAL to close exactly this gap).
+# ---------------------------------------------------------------------------
+
+def test_seed_value_writes_an_override_on_the_first_period(db):
+    spec = _spec(sections=[{
+        "name": "Saldo", "rows": [
+            {"name": "SALDO INICIAL", "row_type": "running_balance", "seed_value": 850000,
+             "rule": {"type": "previous_period", "row_id": "SALDO FINAL"}},
+            {"name": "SALDO FINAL", "row_type": "running_balance",
+             "rule": {"type": "sum_rows", "row_ids": ["SALDO INICIAL"]}},
+        ],
+    }])
+    sheet = import_sheet_spec(db, spec, TEST_USER_ID)
+
+    result = compute_sheet(sheet.id, db)
+    cells = result["sections"][0]["rows"][0]["cells"]
+    assert [c.projected_value for c in cells] == [850000, 850000, 850000]
+    assert find_unseeded_running_balance_rows(db, sheet.id) == []
+
+
+def test_unseeded_running_balance_row_is_detected(db):
+    spec = _spec(sections=[{
+        "name": "Saldo", "rows": [
+            {"name": "SALDO INICIAL", "row_type": "running_balance",
+             "rule": {"type": "previous_period", "row_id": "SALDO FINAL"}},
+            {"name": "SALDO FINAL", "row_type": "running_balance",
+             "rule": {"type": "sum_rows", "row_ids": ["SALDO INICIAL"]}},
+        ],
+    }])
+    sheet = import_sheet_spec(db, spec, TEST_USER_ID)
+
+    # Reproduces the original bug end-to-end: no seed means period 1 is None.
+    result = compute_sheet(sheet.id, db)
+    cells = result["sections"][0]["rows"][0]["cells"]
+    assert cells[0].projected_value is None
+
+    unseeded = find_unseeded_running_balance_rows(db, sheet.id)
+    assert [r.name for r in unseeded] == ["SALDO INICIAL"]
+
+
+def test_hogar_chileno_example_has_a_real_starting_balance(db):
+    """End-to-end against the maintainer's own documented example file --
+    the exact scenario the original bug report was traced through."""
+    example_path = Path(__file__).resolve().parent.parent / "docs" / "examples" / "hogar-chileno.yaml"
+    spec = load_sheet_spec(str(example_path))
+    sheet = import_sheet_spec(db, spec, TEST_USER_ID)
+
+    result = compute_sheet(sheet.id, db)
+    saldo_inicial = next(
+        row_data for section in result["sections"] for row_data in section["rows"]
+        if row_data["row"].name == "SALDO INICIAL"
+    )
+    assert saldo_inicial["cells"][0].projected_value == 850000
+    assert find_unseeded_running_balance_rows(db, sheet.id) == []

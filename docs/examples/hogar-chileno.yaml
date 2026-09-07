@@ -10,6 +10,7 @@ sections:
   - name: SALDO INICIAL
     row_type: running_balance
     sign: positive
+    seed_value: 850000
     rule:
       type: previous_period
       row_id: SALDO FINAL

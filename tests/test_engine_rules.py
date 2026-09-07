@@ -100,7 +100,7 @@ def test_running_balance_chain_via_cross_row_previous_period(db):
     sheet = _make_sheet(db, TEST_USER_ID, months=3)
     section = _make_section(db, sheet)
 
-    saldo_inicial = SheetRow(section_id=section.id, name="Saldo Inicial", row_type="balance", sort_order=0)
+    saldo_inicial = SheetRow(section_id=section.id, name="Saldo Inicial", row_type="input", sort_order=0)
     flujo_neto = SheetRow(section_id=section.id, name="Flujo Neto", row_type="formula", sort_order=1,
                            default_projection_rule={"type": "constant", "value": 100})
     saldo_final = SheetRow(section_id=section.id, name="Saldo Final", row_type="running_balance", sort_order=2)
@@ -263,6 +263,60 @@ def test_unsupported_rule_sets_error(db):
     assert cells[0].error == "unsupported_rule:running_balance"
 
 
+def test_malformed_rule_value_errors_only_that_cell_not_the_whole_sheet(db):
+    """A bad rule TYPE already gets unsupported_rule:<type> (see above,
+    unaffected by this fix). A bad rule VALUE for an otherwise-recognized
+    type -- e.g. a non-numeric "value" on a constant rule -- used to raise
+    decimal.InvalidOperation straight out of compute_sheet(), crashing the
+    computation of the WHOLE sheet including every healthy row on it."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    healthy = SheetRow(section_id=section.id, name="Healthy", sort_order=0,
+                        default_projection_rule={"type": "constant", "value": 100})
+    broken = SheetRow(section_id=section.id, name="Broken", sort_order=1,
+                       default_projection_rule={"type": "constant", "value": "not-a-number"})
+    db.add_all([healthy, broken])
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)  # must not raise
+
+    assert _cells_for(matrix, healthy.id)[0].projected_value == 100
+    broken_cell = _cells_for(matrix, broken.id)[0]
+    assert broken_cell.projected_value is None
+    assert broken_cell.error == "invalid_rule_value:constant"
+
+
+def test_dependency_chain_deeper_than_the_old_20_hop_cap_resolves_fully(db):
+    """MAX_DEPENDENCY_DEPTH=20 used to cut the topo-sort DFS off mid-chain
+    for a dependency chain longer than 20 hops, WITHOUT marking the
+    truncated nodes as visited -- they got evaluated later, out of order,
+    and silently resolved to None with no error at all (indistinguishable
+    from a legitimately empty cell). 23 rows, each summing the previous
+    one, reproduces it."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    rows = [SheetRow(section_id=section.id, name="Row0", sort_order=0,
+                      default_projection_rule={"type": "constant", "value": 1})]
+    db.add(rows[0])
+    db.flush()
+    for i in range(1, 23):
+        row = SheetRow(section_id=section.id, name=f"Row{i}", sort_order=i,
+                        default_projection_rule={"type": "sum_rows", "row_ids": [rows[i - 1].id]})
+        db.add(row)
+        db.flush()
+        rows.append(row)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+
+    for row in rows:
+        cell = _cells_for(matrix, row.id)[0]
+        assert cell.projected_value == 1, f"{row.name} resolved to {cell.projected_value!r}, expected 1"
+        assert cell.error is None
+
+
 # ---------------------------------------------------------------------------
 # 6b: rolling_average — averages the last N periods, skipping (not zeroing)
 #     any that have no value, and resolving to None with no history at all.
@@ -295,10 +349,53 @@ def test_rolling_average_of_full_history(db):
     # Period 3 averages the 3 known periods (100+200+300)/3 = 200.
     assert cells[3].projected_value == Decimal("200")
     # Period 4 averages periods 1-3 (200+300+200)/3, now including the
-    # ROLLING result from period 3, not the raw seed values only.
-    assert cells[4].projected_value == (Decimal("200") + Decimal("300") + Decimal("200")) / Decimal("3")
+    # ROLLING result from period 3, not the raw seed values only. Rounded to
+    # 2 decimal places (233.333... -> 233.33): every projected value is
+    # quantized to CELL_VALUE_PRECISION the moment it leaves rule
+    # evaluation, matching every SheetCell money column's Numeric(14,2) type
+    # instead of carrying full Decimal-context precision through every
+    # dependent calculation with no rounding at all.
+    assert cells[4].projected_value == Decimal("233.33")
     for c in cells:
         assert c.error is None
+
+
+def test_projected_values_are_quantized_to_two_decimals_and_stay_rounded_downstream(db):
+    """No explicit quantization existed anywhere in the engine before --
+    correctness relied entirely on the DB column's Numeric(14,2), which
+    SQLite (used by this whole test suite) does not enforce, so a value
+    like rolling_average's division could carry ~28 digits of Decimal-
+    context precision through every dependent calculation with no rounding
+    at all. Confirms both that the average itself rounds, AND that a
+    sum_rows reading that already-computed value sums the ROUNDED number,
+    not the raw one (233.33 * 3 = 699.99, not 700.00 -- proving downstream
+    rules see the rounded value, not a recomputed raw one)."""
+    sheet = _make_sheet(db, TEST_USER_ID, months=1)
+    section = _make_section(db, sheet)
+
+    triple_row = SheetRow(section_id=section.id, name="Base", sort_order=1,
+                           default_projection_rule={"type": "constant", "value": 700})
+    db.add(triple_row)
+    db.commit()
+    third_row = SheetRow(section_id=section.id, name="Un Tercio", sort_order=2,
+                          default_projection_rule={"type": "percent_of_row", "row_id": triple_row.id, "percent": 100 / 3})
+    db.add(third_row)
+    db.commit()
+    total_row = SheetRow(section_id=section.id, name="Triple", sort_order=3,
+                          default_projection_rule={"type": "sum_rows", "row_ids": [third_row.id, third_row.id, third_row.id]})
+    db.add(total_row)
+    db.commit()
+
+    matrix = compute_sheet(sheet.id, db)
+    third_cell = _cells_for(matrix, third_row.id)[0]
+    total_cell = _cells_for(matrix, total_row.id)[0]
+
+    # 700 * (100/3)/100 = 233.333... -> quantized to 233.33.
+    assert third_cell.projected_value == Decimal("233.33")
+    # sum_rows adds the ALREADY-ROUNDED 233.33 three times (699.99), not
+    # 3 * the raw 233.333...  (which would be 700.00 after only a FINAL
+    # rounding) -- proving downstream rules read the rounded value.
+    assert total_cell.projected_value == Decimal("699.99")
 
 
 def test_rolling_average_skips_missing_periods_instead_of_zeroing(db):

@@ -11,7 +11,7 @@ works end to end, not just that its own unit tests pass in isolation.
 Everything runs against an in-memory SQLite database created fresh each run
 -- it never touches a real `opencashflow.db`.
 """
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import create_engine
@@ -20,7 +20,7 @@ from sqlalchemy.orm import sessionmaker
 import opencashflow.wallet  # noqa: F401 -- registers Wallet/WalletMovement on Base.metadata
 from opencashflow.cli import _do_set_override
 from opencashflow.engine import compute_sheet
-from opencashflow.models import Base, CellActualEntry, SheetCell, SheetPeriod, SheetRow
+from opencashflow.models import Base, CellActualEntry, SheetCell, SheetPeriod
 from opencashflow.period_close import close_period
 from opencashflow.wallet import Wallet
 from opencashflow.wallet_movements import do_wallet_movement_add, do_wallet_movement_undo

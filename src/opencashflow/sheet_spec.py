@@ -29,13 +29,15 @@ for an example spec file (see docs/examples/).
 """
 import json
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
-from opencashflow.models import CashflowSheet, SheetRow, SheetSection
+from opencashflow.enums import RowSign, RowType, SectionType
+from opencashflow.models import CashflowSheet, CellOverride, SheetCell, SheetPeriod, SheetRow, SheetSection
 from opencashflow.periods import generate_periods
 
 # ---------------------------------------------------------------------------
@@ -110,6 +112,21 @@ RuleSpec = Annotated[
     Field(discriminator="type"),
 ]
 
+# Every concrete rule spec class, in one place. _resolve_rule_spec (forward,
+# dict-building), _referenced_names (name-extraction for pre-write
+# validation), and _reverse_resolve_rule (dict -> spec, for export) each
+# independently hand-roll an if/isinstance chain over this same set of
+# types -- a genuine registry mapping type -> callback isn't meaningfully
+# less code here (each function's per-type transformation shape differs
+# enough that it'd mostly relocate the same logic behind lambdas), but nothing
+# previously enforced the three chains covered the same types. This tuple is
+# that single source of truth; see test_sheet_spec.py's parity test, which
+# iterates it to confirm all three dispatches handle every type here.
+RULE_SPEC_CLASSES = (
+    ConstantRuleSpec, PreviousPeriodRuleSpec, SumRowsRuleSpec, PercentOfRowRuleSpec,
+    RollingAverageRuleSpec, CarryForwardRuleSpec,
+)
+
 
 # ---------------------------------------------------------------------------
 # Sheet spec: sheet -> sections -> rows
@@ -118,14 +135,21 @@ RuleSpec = Annotated[
 
 class RowSpec(BaseModel):
     name: str
-    row_type: str = "input"
-    sign: str = "positive"
+    row_type: RowType = "input"
+    sign: RowSign = "positive"
     rule: Optional[RuleSpec] = None
+    # Only meaningful for a row_type="running_balance" row whose rule reads
+    # previous_period: period 1 has no previous period to read from, so
+    # without an explicit seed it silently resolves to None and every
+    # period after it is built on an assumed starting balance of $0 (see
+    # import_sheet_spec/find_unseeded_running_balance_rows). Written as a
+    # manual_value override on this row's first period at import time.
+    seed_value: Optional[float] = None
 
 
 class SectionSpec(BaseModel):
     name: str
-    section_type: str = "custom"
+    section_type: SectionType = "custom"
     rows: List[RowSpec] = Field(default_factory=list)
 
 
@@ -210,53 +234,170 @@ def _resolve_rule_spec(
     raise AssertionError(f"Tipo de regla no reconocido (no debería pasar validación de Pydantic): {rule!r}")
 
 
-def import_sheet_spec(db: Session, spec: SheetSpec, user_id: int) -> CashflowSheet:
-    """Build a whole CashflowSheet -- sections, rows, and every row's
-    projection rule -- from a validated SheetSpec, in two passes (see this
-    module's own docstring). Raises ValueError (never sys.exit, this is
-    library-shaped) on a duplicate row name anywhere in the sheet, or an
-    unresolvable row_id/row_ids name reference."""
-    base_period_dt = datetime(spec.sheet.base_period.year, spec.sheet.base_period.month, 1)
-    sheet = CashflowSheet(
-        user_id=user_id, name=spec.sheet.name, currency=spec.sheet.currency,
-        horizon_months=spec.sheet.horizon_months, base_period=base_period_dt,
-    )
-    db.add(sheet)
-    db.flush()
-    generate_periods(sheet, db)
-    db.flush()
+def _referenced_names(rule: Optional[RuleSpec]) -> List[str]:
+    """Every row NAME `rule` references (row_id/row_ids), recursing into a
+    carry_forward's own base_rule -- a pure walk over spec data, no db, no
+    real row ids needed yet. This is what lets _validate_row_names_before_write
+    check reference-resolvability up front, before a single row exists."""
+    if isinstance(rule, PreviousPeriodRuleSpec):
+        return [rule.row_id] if rule.row_id is not None else []
+    if isinstance(rule, SumRowsRuleSpec):
+        return list(rule.row_ids)
+    if isinstance(rule, PercentOfRowRuleSpec):
+        return [rule.row_id]
+    if isinstance(rule, CarryForwardRuleSpec):
+        return _referenced_names(rule.base_rule)
+    return []
 
-    name_to_row: Dict[str, SheetRow] = {}
-    for section_idx, section_spec in enumerate(spec.sections):
-        section = SheetSection(
-            sheet_id=sheet.id, name=section_spec.name, section_type=section_spec.section_type,
-            sort_order=section_idx,
-        )
-        db.add(section)
-        db.flush()
-        for row_idx, row_spec in enumerate(section_spec.rows):
-            if row_spec.name in name_to_row:
+
+def _validate_row_names_before_write(spec: SheetSpec) -> None:
+    """Check name-uniqueness and reference-resolvability against the pure,
+    in-memory SheetSpec -- before import_sheet_spec writes a single row.
+
+    Both checks are ALSO still enforced during the write itself (see below);
+    this pre-pass exists so a bad spec never gets even a half-built
+    CashflowSheet into the session in the first place, rather than relying
+    on the caller to roll back after a ValueError raised mid-write."""
+    seen: set = set()
+    for section_spec in spec.sections:
+        for row_spec in section_spec.rows:
+            if row_spec.name in seen:
                 raise ValueError(
                     f"Nombre de fila duplicado: '{row_spec.name}' aparece más de una vez en este "
                     f"sheet spec -- cada fila necesita un nombre único para que las referencias "
                     f"(row_id/row_ids) se puedan resolver sin ambigüedad."
                 )
-            row = SheetRow(
-                section_id=section.id, name=row_spec.name, row_type=row_spec.row_type,
-                sign=row_spec.sign, sort_order=row_idx, default_projection_rule=None,
-            )
-            db.add(row)
-            name_to_row[row_spec.name] = row
-    db.flush()
-
+            seen.add(row_spec.name)
     for section_spec in spec.sections:
         for row_spec in section_spec.rows:
-            if row_spec.rule is not None:
-                row = name_to_row[row_spec.name]
-                row.default_projection_rule = _resolve_rule_spec(row_spec.rule, name_to_row, row_spec.name)
-    db.commit()
+            for ref_name in _referenced_names(row_spec.rule):
+                if ref_name not in seen:
+                    raise ValueError(
+                        f"La fila '{row_spec.name}' hace referencia a la fila '{ref_name}', que no "
+                        f"existe en este sheet spec -- ninguna fila con ese nombre fue definida."
+                    )
+
+
+def import_sheet_spec(db: Session, spec: SheetSpec, user_id: int) -> CashflowSheet:
+    """Build a whole CashflowSheet -- sections, rows, and every row's
+    projection rule -- from a validated SheetSpec, in two passes (see this
+    module's own docstring). Raises ValueError (never sys.exit, this is
+    library-shaped) on a duplicate row name anywhere in the sheet, or an
+    unresolvable row_id/row_ids name reference -- checked up front against
+    the pure spec (see _validate_row_names_before_write) so neither failure
+    can leave a half-built CashflowSheet in the session; a try/except around
+    the write itself is a second safety net against anything else going
+    wrong mid-write."""
+    _validate_row_names_before_write(spec)
+
+    try:
+        base_period_dt = datetime(spec.sheet.base_period.year, spec.sheet.base_period.month, 1)
+        sheet = CashflowSheet(
+            user_id=user_id, name=spec.sheet.name, currency=spec.sheet.currency,
+            horizon_months=spec.sheet.horizon_months, base_period=base_period_dt,
+        )
+        db.add(sheet)
+        db.flush()
+        generate_periods(sheet, db)
+        db.flush()
+
+        name_to_row: Dict[str, SheetRow] = {}
+        for section_idx, section_spec in enumerate(spec.sections):
+            section = SheetSection(
+                sheet_id=sheet.id, name=section_spec.name, section_type=section_spec.section_type,
+                sort_order=section_idx,
+            )
+            db.add(section)
+            db.flush()
+            for row_idx, row_spec in enumerate(section_spec.rows):
+                if row_spec.name in name_to_row:
+                    raise ValueError(
+                        f"Nombre de fila duplicado: '{row_spec.name}' aparece más de una vez en este "
+                        f"sheet spec -- cada fila necesita un nombre único para que las referencias "
+                        f"(row_id/row_ids) se puedan resolver sin ambigüedad."
+                    )
+                row = SheetRow(
+                    section_id=section.id, name=row_spec.name, row_type=row_spec.row_type,
+                    sign=row_spec.sign, sort_order=row_idx, default_projection_rule=None,
+                )
+                db.add(row)
+                name_to_row[row_spec.name] = row
+        db.flush()
+
+        for section_spec in spec.sections:
+            for row_spec in section_spec.rows:
+                if row_spec.rule is not None:
+                    row = name_to_row[row_spec.name]
+                    row.default_projection_rule = _resolve_rule_spec(row_spec.rule, name_to_row, row_spec.name)
+
+        first_period = (
+            db.query(SheetPeriod)
+            .filter(SheetPeriod.sheet_id == sheet.id)
+            .order_by(SheetPeriod.sort_order)
+            .first()
+        )
+        for section_spec in spec.sections:
+            for row_spec in section_spec.rows:
+                if row_spec.seed_value is not None:
+                    row = name_to_row[row_spec.name]
+                    cell = SheetCell(row_id=row.id, period_id=first_period.id)
+                    db.add(cell)
+                    db.flush()
+                    db.add(CellOverride(
+                        cell_id=cell.id, value=Decimal(str(row_spec.seed_value)),
+                        override_type="manual_value",
+                        note=f"sheet import: seed_value for '{row_spec.name}'",
+                        created_by=user_id,
+                    ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(sheet)
     return sheet
+
+
+def find_unseeded_running_balance_rows(db: Session, sheet_id: int) -> List[SheetRow]:
+    """Every row_type="running_balance" row on this sheet whose rule reads
+    previous_period but has no value at all (no active override, no
+    accrued/actual) in the sheet's first period -- meaning its whole
+    projection is silently anchored to an assumed starting value of $0 (see
+    RowSpec.seed_value above). Pure read, no writes -- meant for a caller
+    (e.g. a `doctor`-style diagnostic command) to surface this loudly,
+    instead of a sheet reporting "no problems detected" while every number
+    on it rests on an unstated assumption."""
+    first_period = (
+        db.query(SheetPeriod)
+        .filter(SheetPeriod.sheet_id == sheet_id)
+        .order_by(SheetPeriod.sort_order)
+        .first()
+    )
+    if first_period is None:
+        return []
+    rows = (
+        db.query(SheetRow)
+        .join(SheetSection)
+        .filter(SheetSection.sheet_id == sheet_id, SheetRow.row_type == "running_balance")
+        .all()
+    )
+    unseeded = []
+    for row in rows:
+        rule = row.default_projection_rule or {}
+        if rule.get("type") != "previous_period":
+            continue
+        cell = (
+            db.query(SheetCell)
+            .filter(SheetCell.row_id == row.id, SheetCell.period_id == first_period.id)
+            .first()
+        )
+        has_value = cell is not None and (
+            any(ov.superseded_at is None for ov in cell.overrides)
+            or cell.accrued_value is not None
+            or cell.actual_value is not None
+        )
+        if not has_value:
+            unseeded.append(row)
+    return unseeded
 
 
 def _reverse_resolve_name(row_id: int, id_to_name: Dict[int, str], referencing_row_name: str) -> str:

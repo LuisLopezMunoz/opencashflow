@@ -140,6 +140,70 @@ def test_row_with_no_aggregation_path_is_rejected(db, built):
 
 
 # ---------------------------------------------------------------------------
+# sheet_id/period/row/currency cross-checks -- do_wallet_movement_add used
+# to take sheet_id as an independent parameter with no assertion that it
+# actually matched the period or row passed alongside it, and no check that
+# the wallet's currency matched the sheet's -- a caller bug (wrong id
+# threaded through) or a cross-currency wallet used to silently write a
+# WalletMovement with a wrong sheet_id, or mix amounts across currencies
+# with no conversion, instead of raising.
+# ---------------------------------------------------------------------------
+
+def test_mismatched_sheet_id_and_period_is_rejected(db, built):
+    wallet, sueldo, period = built["wallet"], built["sueldo"], built["period1"]
+    with pytest.raises(ValueError, match="sheet_id/period"):
+        do_wallet_movement_add(db, wallet, built["sheet"].id + 999, sueldo, period, Decimal("1"),
+                                note=None, created_by=TEST_USER_ID)
+    db.refresh(wallet)
+    assert wallet.balance == 100_000.0
+
+
+def test_mismatched_sheet_id_and_row_is_rejected(db):
+    # A second, unrelated sheet with its own row -- passing the FIRST
+    # sheet's id/period alongside the SECOND sheet's row must be rejected.
+    other_sheet = CashflowSheet(user_id=TEST_USER_ID, name="Other Sheet", currency="CLP",
+                                 horizon_months=1, base_period=datetime(2026, 1, 1))
+    db.add(other_sheet)
+    db.flush()
+    other_section = SheetSection(sheet_id=other_sheet.id, name="Other Section", section_type="income")
+    db.add(other_section)
+    db.flush()
+    other_row = SheetRow(section_id=other_section.id, name="Other Row", sign="positive")
+    db.add(other_row)
+    db.commit()
+
+    built_db_sheet = CashflowSheet(user_id=TEST_USER_ID, name="Wallet Movement Test Sheet 2", currency="CLP",
+                                    horizon_months=1, base_period=datetime(2026, 1, 1))
+    db.add(built_db_sheet)
+    db.flush()
+    period = SheetPeriod(sheet_id=built_db_sheet.id, period_date=datetime(2026, 1, 1), label="P0", sort_order=0)
+    db.add(period)
+    db.commit()
+
+    wallet = Wallet(user_id=TEST_USER_ID, name="Santander", wallet_type="bank", currency="CLP", balance=0)
+    db.add(wallet)
+    db.commit()
+
+    with pytest.raises(ValueError, match="sheet_id/row"):
+        do_wallet_movement_add(db, wallet, built_db_sheet.id, other_row, period, Decimal("1"),
+                                note=None, created_by=TEST_USER_ID)
+
+
+def test_mismatched_currency_is_rejected(db, built):
+    sueldo, period = built["sueldo"], built["period1"]
+    usd_wallet = Wallet(user_id=TEST_USER_ID, name="USD Account", wallet_type="bank",
+                         currency="USD", balance=0)
+    db.add(usd_wallet)
+    db.commit()
+
+    with pytest.raises(ValueError, match="currenc"):
+        do_wallet_movement_add(db, usd_wallet, built["sheet"].id, sueldo, period, Decimal("1"),
+                                note=None, created_by=TEST_USER_ID)
+    db.refresh(usd_wallet)
+    assert usd_wallet.balance == 0
+
+
+# ---------------------------------------------------------------------------
 # additive on the same cell, unlike an absolute set
 # ---------------------------------------------------------------------------
 
@@ -187,6 +251,29 @@ def test_undoing_a_reversal_is_rejected(db, built):
     undo_result = do_wallet_movement_undo(db, added.movement, note=None, created_by=TEST_USER_ID)
     with pytest.raises(ValueError, match="itself a reversal"):
         do_wallet_movement_undo(db, undo_result.reversal, note=None, created_by=TEST_USER_ID)
+
+
+def test_reverses_movement_id_is_unique_at_the_db_level(db, built):
+    """The actual backstop test_undo_twice_is_rejected's plain SELECT check
+    can't cover: two WalletMovement rows can never share the same non-null
+    reverses_movement_id, even bypassing do_wallet_movement_undo entirely.
+    This is what protects against the real TOCTOU race -- two concurrent
+    undo calls both passing the SELECT check before either commits -- that
+    the SELECT check alone can't."""
+    wallet, sueldo, period = built["wallet"], built["sueldo"], built["period1"]
+    added = do_wallet_movement_add(db, wallet, built["sheet"].id, sueldo, period, Decimal("500000"),
+                                    note=None, created_by=TEST_USER_ID)
+    do_wallet_movement_undo(db, added.movement, note=None, created_by=TEST_USER_ID)
+
+    # A second, independent reversal row for the SAME original movement --
+    # exactly what two concurrent do_wallet_movement_undo calls would each
+    # try to insert after both pass the (racy) SELECT check.
+    db.add(WalletMovement(wallet_id=wallet.id, amount=Decimal("1"), sheet_id=built["sheet"].id,
+                           row_id=sueldo.id, period_id=period.id, actual_entry_id=1,
+                           reverses_movement_id=added.movement.id, created_by=TEST_USER_ID))
+    with pytest.raises(Exception, match="UNIQUE"):
+        db.commit()
+    db.rollback()
 
 
 def test_undo_refused_when_something_newer_sits_on_top(db, built):

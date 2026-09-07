@@ -80,7 +80,7 @@ def _build_sheet(db, *, months, leaf_rows, base_period=datetime(2026, 1, 1)):
     row_ids = {}
     for spec in leaf_rows:
         row = SheetRow(section_id=sec_mov.id, name=spec["name"], sign=spec.get("sign", "positive"),
-                        default_projection_rule=spec["rule"])
+                        row_type=spec.get("row_type", "input"), default_projection_rule=spec["rule"])
         db.add(row)
         db.flush()
         row_ids[spec["name"]] = row.id
@@ -315,3 +315,180 @@ def test_carry_forward_row_skipped_in_rollover_write(db):
     )
     assert cell.projected_value == Decimal("35000")
     assert cell.error is None
+
+
+# ---------------------------------------------------------------------------
+# 7. A row_type="formula" row (a computed sum_rows/derived row, never a real
+#    per-row obligation of its own) must never be treated like a leaf
+#    obligation when assume_unrecorded_as_pending backfills unrecorded rows.
+#    AGGREGATE_ROW_TYPES used to omit "formula" entirely, so a formula row
+#    got (a) a synthetic accrued/paid value written directly onto it --
+#    double-counting the same real cash against both the leaf row AND its
+#    formula aggregate -- and (b) permanently frozen at a hardcoded
+#    manual_value override for the next period, disconnected from its own
+#    sum_rows computation forever.
+# ---------------------------------------------------------------------------
+
+def test_formula_row_is_never_backfilled_as_pending(db):
+    ids = _build_sheet(db, months=2, leaf_rows=[
+        {"name": "FlujoNeto", "row_type": "formula", "rule": {"type": "constant", "value": 70_000}},
+    ])
+    p0, p1 = (p.id for p in ids["periods"])
+    flujo_id = ids["row_ids"]["FlujoNeto"]
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+
+    report = close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID,
+                           assume_unrecorded_as_pending=True)
+
+    # No warning AND no rollover for the formula row -- it's silently
+    # excluded from "pending this period" entirely, exactly like the
+    # subtotal/total/running_balance/label/separator types already were.
+    assert report.warnings == []
+    assert report.rollovers == []
+
+    # No synthetic accrued/paid entry was written onto it (the double-count).
+    cell_p0 = db.query(SheetCell).filter(SheetCell.row_id == flujo_id, SheetCell.period_id == p0).first()
+    assert cell_p0 is None or cell_p0.accrued_value is None
+
+    # No hardcoded override was written for the next period either (the
+    # permanent freeze) -- it must still resolve via its own constant rule.
+    assert _active_override_value(db, flujo_id, p1) is None
+    result = compute_sheet(ids["sheet_id"], db)
+    cell_p1 = next(
+        cr for section in result["sections"] for row_data in section["rows"]
+        if row_data["row"].id == flujo_id for cr in row_data["cells"] if cr.period_id == p1
+    )
+    assert cell_p1.projected_value == Decimal("70000")
+    assert cell_p1.error is None
+
+
+# ---------------------------------------------------------------------------
+# 8. Closing a period whose real-value walk hits a dependency cycle must
+#    raise ValueError (this module's documented contract: "never sys.exit,
+#    never a web-framework exception... only ever raises ValueError"), not
+#    crash with an unhandled RecursionError. _real_value used to re-walk
+#    sum_rows independently of compute_sheet with no cycle protection of its
+#    own at all.
+# ---------------------------------------------------------------------------
+
+def test_close_period_on_cyclic_dependency_raises_value_error_not_recursion_error(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[
+        {"name": "A", "rule": {"type": "constant", "value": 0}},
+        {"name": "B", "rule": {"type": "constant", "value": 0}},
+    ])
+    (p0,) = (p.id for p in ids["periods"])
+    a_id, b_id = ids["row_ids"]["A"], ids["row_ids"]["B"]
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+
+    # Rewire A and B into a genuine cycle: A depends on B, B depends on A.
+    # Both are still listed among SALDO FINAL's sum_rows operands (from
+    # _build_sheet), so close_period's real-net-flow walk recurses into them.
+    a_row = db.query(SheetRow).filter(SheetRow.id == a_id).first()
+    b_row = db.query(SheetRow).filter(SheetRow.id == b_id).first()
+    a_row.default_projection_rule = {"type": "sum_rows", "row_ids": [b_id]}
+    b_row.default_projection_rule = {"type": "sum_rows", "row_ids": [a_id]}
+    db.commit()
+
+    with pytest.raises(ValueError, match="cycle"):
+        close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+
+
+# ---------------------------------------------------------------------------
+# 9. Closing the sheet's last period with unrolled pending: surfaced as a
+#    warning too, not only as free text buried in CloseReport.rollovers.
+# ---------------------------------------------------------------------------
+
+def test_unrolled_pending_amount_is_surfaced_as_a_warning(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[
+        {"name": "GastoFinal", "sign": "negative", "rule": {"type": "constant", "value": 50_000}},
+    ])
+    (p0,) = (p.id for p in ids["periods"])
+    gasto_id = ids["row_ids"]["GastoFinal"]
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+    _write_actual(db, gasto_id, p0, accrued_value=50_000, paid_value=0)
+
+    report = close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+
+    assert report.next_period_label is None
+    assert len(report.rollovers) == 1
+    assert report.rollovers[0].disposition == "no next period (could not roll forward)"
+    assert any("GastoFinal" in w and "no next period" in w for w in report.warnings)
+
+
+# ---------------------------------------------------------------------------
+# 10. Next-period lookup is by calendar date, not sort_order + 1 -- a gap in
+#     sort_order must not make an otherwise-adjacent period invisible.
+# ---------------------------------------------------------------------------
+
+def test_next_period_found_across_a_sort_order_gap(db):
+    ids = _build_sheet(db, months=2, leaf_rows=[
+        {"name": "GastoFantasma", "sign": "negative", "rule": {"type": "constant", "value": 70_000}},
+    ])
+    p0, p1 = ids["periods"]
+    gasto_id = ids["row_ids"]["GastoFantasma"]
+    _write_override(db, ids["saldo_inicial_id"], p0.id, 1_000_000)
+    _write_actual(db, gasto_id, p0.id, accrued_value=70_000, paid_value=0)
+
+    # Introduce a gap: p1 (Feb 2026) keeps its correct period_date but its
+    # sort_order jumps from 1 to 50 -- simulating a manually-edited sheet.
+    p1.sort_order = 50
+    db.commit()
+
+    report = close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0.id), TEST_USER_ID)
+
+    assert report.next_period_label == (p1.label or "Feb-26")
+    assert len(report.rollovers) == 1
+    assert report.rollovers[0].disposition == "override written"
+    # GastoFantasma's own constant rule already projects 70000 for p1 too;
+    # the rollover adds the pending 70000 from p0 on top of that baseline.
+    assert _active_override_value(db, gasto_id, p1.id) == Decimal("140000")
+
+
+# ---------------------------------------------------------------------------
+# 11. An exception mid-write leaves the database exactly as it was before
+#     close_period was called -- the write phase now has its own rollback
+#     safety net, matching the guard-checking phase's existing one.
+# ---------------------------------------------------------------------------
+
+def test_exception_mid_write_leaves_the_database_unchanged(db, monkeypatch):
+    ids = _build_sheet(db, months=2, leaf_rows=[
+        {"name": "Gasto", "sign": "negative", "rule": {"type": "constant", "value": 50_000}},
+    ])
+    p0, p1 = ids["periods"]
+    gasto_id = ids["row_ids"]["Gasto"]
+    _write_override(db, ids["saldo_inicial_id"], p0.id, 1_000_000)
+    _write_actual(db, gasto_id, p0.id, accrued_value=50_000, paid_value=0)
+
+    overrides_before = _count_overrides(db)
+
+    import opencashflow.period_close as period_close_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure mid-write")
+
+    # Fails on the ROLLOVER write, i.e. after the balance_final override has
+    # already been written -- proving the whole write phase rolls back
+    # together, not just the step that happened to fail.
+    real_supersede = period_close_module.supersede_and_write_override
+    calls = {"n": 0}
+
+    def supersede_that_fails_on_second_call(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            boom()
+        return real_supersede(*args, **kwargs)
+
+    monkeypatch.setattr(period_close_module, "supersede_and_write_override", supersede_that_fails_on_second_call)
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0.id), TEST_USER_ID)
+
+    # Deliberately NOT calling db.rollback() here ourselves -- that would
+    # mask whether close_period's OWN rollback matters. The balance_final
+    # override write (the first supersede_and_write_override call) already
+    # succeeded and was flushed before the second call raised; if
+    # close_period's except-block didn't roll back internally, that flushed
+    # write would still be visible on this same session/transaction.
+    period_after = _period(db, p0.id)
+    assert period_after.is_closed is False
+    assert _count_overrides(db) == overrides_before

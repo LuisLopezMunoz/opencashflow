@@ -17,27 +17,36 @@ from typing import List, Optional, Tuple
 
 from opencashflow.models import CellActualEntry, SheetCell, SheetPeriod
 
-# Every entry pop_record_stack() itself writes gets this note PREFIX (any
-# caller-supplied note text is appended after it, never replaces it) -- it's
-# how a later call tells "this entry is itself the result of a previous
-# undo" from "this is a real recorded value" when replaying the log. Kept
-# private: nothing outside replay_record_stack/pop_record_stack needs to
-# read this constant directly -- callers should never hand-roll their own
-# note.startswith(...) check against it.
-_RECORD_UNDO_MARKER = "[record undo] "
+# Kept only as a human-readable annotation on the note field now -- NOT load-
+# bearing for push/pop detection anymore (see EntryKind/CellActualEntry.
+# entry_kind in models.py/enums.py). It used to be the ONLY signal: any
+# caller-supplied note happening to start with this exact string would have
+# been silently mistaken for a previous undo, corrupting which entry
+# replay_record_stack treats as "current" -- with nothing anywhere reserving
+# this prefix against that. See MIGRATIONS.md for the entry_kind backfill.
+_RECORD_UNDO_NOTE_PREFIX = "[record undo] "
+
+
+class EmptyRecordStackError(ValueError):
+    """Raised by pop_record_stack when the cell's record stack is already
+    empty. A dedicated type (rather than a sentinel string inside a plain
+    ValueError, which is all this used to be) so a caller can distinguish
+    "expected empty stack" from "something else went wrong" without string-
+    matching the exception's message -- still a ValueError, so an existing
+    `except ValueError:` catches it exactly as before."""
 
 
 def replay_record_stack(entries: List[CellActualEntry]) -> List[CellActualEntry]:
     """Replays `entries` (already in chronological order, e.g.
-    cell.actual_entries) as a push/pop log: an entry whose note starts with
-    the undo marker is a POP (the result of a previous pop_record_stack()
-    call), every other entry -- however it was written -- is a PUSH. Returns
-    the resulting stack (oldest first); its top (`stack[-1]`, when
-    non-empty) is the logically "current" entry.
+    cell.actual_entries) as a push/pop log: an entry whose entry_kind is
+    "undo" is a POP (the result of a previous pop_record_stack() call),
+    every other entry -- however it was written -- is a PUSH. Returns the
+    resulting stack (oldest first); its top (`stack[-1]`, when non-empty) is
+    the logically "current" entry.
     """
     stack: List[CellActualEntry] = []
     for entry in entries:
-        if entry.note and entry.note.startswith(_RECORD_UNDO_MARKER):
+        if entry.entry_kind == "undo":
             if stack:
                 stack.pop()
         else:
@@ -69,17 +78,18 @@ def pop_record_stack(
     reverted_to, new_entry); `reverted_to` is None when the popped entry was
     the only one left (the cell goes back to "no value recorded").
 
-    Raises ValueError("__empty_stack__") if the stack is already empty --
-    callers with their own row/period-named message should catch this and
-    raise their own; this function has no such context to phrase one. Does
-    NOT check period.is_closed (call guard_periods_not_closed first) or "is
-    this the entry I expected on top" -- callers with their own specific
-    requirements (e.g. a wallet-movement undo checking it's reverting its
-    own write, not something written after it) do those before calling this.
+    Raises EmptyRecordStackError (a ValueError) if the stack is already
+    empty -- callers with their own row/period-named message should catch
+    this and raise their own; this function has no such context to phrase
+    one. Does NOT check period.is_closed (call guard_periods_not_closed
+    first) or "is this the entry I expected on top" -- callers with their
+    own specific requirements (e.g. a wallet-movement undo checking it's
+    reverting its own write, not something written after it) do those
+    before calling this.
     """
     stack = replay_record_stack(list(cell.actual_entries))
     if not stack:
-        raise ValueError("__empty_stack__")
+        raise EmptyRecordStackError("The record stack for this cell is already empty.")
 
     reverted_from = stack[-1]
     stack_after = stack[:-1]
@@ -92,13 +102,11 @@ def pop_record_stack(
     cell.accrued_value = new_accrued
     cell.paid_value = new_paid
 
-    # Always keep the marker's trailing space -- replay_record_stack's
-    # startswith(_RECORD_UNDO_MARKER) check requires it verbatim, even when
-    # there's no caller-supplied note to append after it.
-    full_note = _RECORD_UNDO_MARKER + note if note else _RECORD_UNDO_MARKER
     new_entry = CellActualEntry(
         cell_id=cell.id, actual_value=new_actual, accrued_value=new_accrued, paid_value=new_paid,
-        note=full_note, created_by=created_by,
+        entry_kind="undo",
+        note=(_RECORD_UNDO_NOTE_PREFIX + note if note else _RECORD_UNDO_NOTE_PREFIX),
+        created_by=created_by,
     )
     db.add(new_entry)
     db.flush()

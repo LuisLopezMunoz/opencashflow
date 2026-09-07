@@ -180,6 +180,11 @@ def test_installment_schedule_uneven_amount_sums_exactly_remainder_on_last(db):
     assert sum(schedule) == Decimal("1000000")
 
 
+def test_installment_schedule_rejects_less_than_one_installment():
+    with pytest.raises(ValueError, match="installments"):
+        installment_schedule(Decimal("1000"), 0)
+
+
 # ---------------------------------------------------------------------------
 # 2. compute_instant_statement: previous_balance known / unknown
 # ---------------------------------------------------------------------------
@@ -373,6 +378,51 @@ def test_sync_period_raises_without_mapping_or_explicit_target(db, card):
 
 
 # ---------------------------------------------------------------------------
+# 6b. "stale mapping" guards -- a card's mapped_sheet_id/mapped_row_id
+# pointing at something that no longer exists, or a row that exists but
+# belongs to a DIFFERENT sheet than the mapped one. Previously implemented
+# but untested.
+# ---------------------------------------------------------------------------
+
+def test_sync_period_raises_when_mapped_sheet_no_longer_exists(db, card, row):
+    card.mapped_sheet_id = 999_999
+    card.mapped_row_id = row.id
+    db.commit()
+
+    with pytest.raises(ValueError, match="ya no existe"):
+        sync_period(db, card, None, None, date(2026, 1, 1), TEST_USER_ID)
+
+
+def test_sync_period_raises_when_mapped_row_no_longer_exists(db, card, sheet):
+    card.mapped_sheet_id = sheet.id
+    card.mapped_row_id = 999_999
+    db.commit()
+
+    with pytest.raises(ValueError, match="ya no existe"):
+        sync_period(db, card, None, None, date(2026, 1, 1), TEST_USER_ID)
+
+
+def test_sync_period_raises_when_row_belongs_to_a_different_sheet(db, card, sheet, row):
+    other_sheet = CashflowSheet(user_id=TEST_USER_ID, name="Otra Planilla", currency="CLP",
+                                 horizon_months=1, base_period=datetime(2026, 1, 1))
+    db.add(other_sheet)
+    db.commit()
+
+    card.mapped_sheet_id = other_sheet.id  # row belongs to `sheet`, not `other_sheet`
+    card.mapped_row_id = row.id
+    db.commit()
+
+    with pytest.raises(ValueError, match="no pertenece"):
+        sync_period(db, card, None, None, date(2026, 1, 1), TEST_USER_ID)
+
+
+def test_sync_period_raises_when_sheet_has_no_period_for_that_month(db, card, sheet, row):
+    # `sheet` only has periods for 2026-01..03 (see the fixture).
+    with pytest.raises(ValueError, match="no tiene un período"):
+        sync_period(db, card, sheet, row, date(2027, 1, 1), TEST_USER_ID)
+
+
+# ---------------------------------------------------------------------------
 # 7. dry_run persists nothing
 # ---------------------------------------------------------------------------
 
@@ -419,6 +469,18 @@ def test_sync_period_dry_run_branch_a_leaves_accrued_value_untouched(db, card, s
 
 def test_resolve_credit_card_by_id(db, card):
     assert resolve_credit_card(db, None, str(card.id)).id == card.id
+
+
+def test_resolve_credit_card_by_id_with_surrounding_whitespace(db, card):
+    # .strip() before .isdigit(): a copy-pasted id with stray whitespace
+    # used to silently fall through to the name-substring match instead of
+    # the numeric lookup a caller clearly meant.
+    assert resolve_credit_card(db, None, f" {card.id} ").id == card.id
+
+
+def test_resolve_credit_card_by_numeric_id_not_found_raises(db, card):
+    with pytest.raises(ValueError, match="No existe la tarjeta"):
+        resolve_credit_card(db, None, str(card.id + 999_999))
 
 
 def test_resolve_credit_card_by_exact_name(db, card):
@@ -518,6 +580,13 @@ def test_sync_period_branch_a_uses_lag_shifted_billing_period(db, card_with_lag,
 # ---------------------------------------------------------------------------
 # 10. cupo_disponible / _cupo_disponible_real_ahora
 # ---------------------------------------------------------------------------
+
+def test_cupo_disponible_raises_when_card_has_no_closing_day(db, card):
+    card.closing_day = None
+    db.commit()
+    with pytest.raises(ValueError, match="día de cierre"):
+        cupo_disponible(db, card, date(2026, 1, 10))
+
 
 def test_cupo_disponible_estimate_from_active_installments_before_closing(db, card):
     # closing_day=25 -- today (2026-01-10) is BEFORE closing, so the open
