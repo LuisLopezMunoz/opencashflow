@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opencashflow"
-version = "0.11.1"
+version = "0.12.0"
 description = "Motor de proyección de flujo de caja: modelos SQLAlchemy, engine de cálculo y schemas Pydantic, agnóstico de framework web y de ledger."
 readme = "README.md"
 license = "Apache-2.0"
@@ -36,10 +36,52 @@ Repository = "https://github.com/LuisLopezMunoz/opencashflow"
 Issues = "https://github.com/LuisLopezMunoz/opencashflow/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
 opencashflow = "opencashflow.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/opencashflow"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# cli.py/cli_export.py are the CLI layer -- out of scope for this
+# remediation pass (reviewed/maintained separately from the core library).
+# They have a handful of pre-existing lint issues (unused imports) as of
+# this writing, predating any change made here. Remove this exclusion once
+# those are cleaned up, or once CLI-layer linting is set up on its own
+# terms -- don't let it silently become permanent.
+extend-exclude = ["src/opencashflow/cli.py", "src/opencashflow/cli_export.py"]
+
+[tool.ruff.lint]
+# Starter baseline: default rule set only (pyflakes + a slice of pycodestyle).
+# The codebase has no lint history, so nothing stricter is enabled yet -- this
+# is meant to grow over time, not land as a wall of unrelated fixes on day one.
+select = ["E", "F", "W"]
+# E501 (line-too-long) alone accounts for 444/456 violations on the existing
+# codebase -- almost all in test files with long parametrized asserts. Fixing
+# those is pure reflow churn unrelated to any actual bug; revisit once/if a
+# formatter (ruff format / black) is adopted to handle wrapping automatically.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+# Scoped to files that already have some type-hint discipline, or that a
+# remediation phase has just touched. Widen this list as more of the
+# codebase gets typed -- a whole-repo strict run on day one would surface
+# hundreds of pre-existing gaps unrelated to any specific change.
+files = [
+    "src/opencashflow/enums.py",
+    "src/opencashflow/models.py",
+]
+# Widening this list to a file that READS ORM instance attributes (engine.py,
+# period_close.py, periods.py, ...) currently floods mypy with ~90 spurious
+# "Column[int] vs int" errors: every model here uses the legacy Column(...)
+# declarative style rather than SQLAlchemy 2.0's Mapped[]/mapped_column(),
+# and mypy can't infer instance-attribute types from a plain Column() without
+# either that migration or a plugin -- sqlalchemy2-stubs is deprecated for
+# 2.0 and does not fix this. Widening further needs that migration first,
+# not just adding more files here.
