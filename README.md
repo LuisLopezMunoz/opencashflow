@@ -21,8 +21,8 @@ pip install "opencashflow @ git+https://github.com/LuisLopezMunoz/opencashflow.g
 
 Esto también instala el comando `opencashflow` (equivalente a `python -m
 opencashflow.cli`) -- una CLI standalone, independiente de cualquier app consumidora
-(sin ledger, sin tarjetas de crédito, sin auth multiusuario), útil para probar la
-librería o correr el demo de abajo.
+(sin ledger, sin auth multiusuario), útil para probar la librería o correr el demo de
+abajo.
 
 ## Demo en un minuto
 
@@ -30,14 +30,17 @@ librería o correr el demo de abajo.
 opencashflow seed --user-id 1 --months 12 --base-period 2026-01
 opencashflow rows --sheet-id 1
 opencashflow doctor --sheet-id 1
+opencashflow show --sheet-id 1
 ```
 
 Esto crea (en una base SQLite descartable, `./opencashflow-demo.db` por defecto) una
 planilla de ejemplo realista -- un hogar chileno con ingresos, gastos fijos/variables,
-impuestos, financiamiento y un saldo acumulado -- y lista sus filas y reglas. (`show`,
-el renderizador de tabla completo, no está en la CLI standalone -- es una de las pocas
-funciones que se quedaron del lado de una app consumidora real; ver
-[docs/model.md](docs/model.md), sección "CLI genérico".)
+impuestos, financiamiento y un saldo acumulado -- lista sus filas y reglas, y por
+último muestra la matriz calculada como tabla. (`--cards`/`--bridge` -- tarjetas de
+crédito con parseo de PDF de banco y financiamiento puente -- son de las pocas cosas
+que se quedan del lado de una app consumidora real; el modelo básico de tarjeta y
+`creditcard list/edit/cupo/map` sí son parte de esta CLI standalone. Ver
+[docs/model.md](docs/model.md), secciones "CLI genérico" y "Tarjetas de crédito".)
 
 El mismo ejemplo vive como archivo declarativo en
 [docs/examples/hogar-chileno.yaml](docs/examples/hogar-chileno.yaml) -- una planilla

@@ -18,10 +18,13 @@ def _build():
     return parser, ext
 
 
-def test_returns_all_five_extension_points():
+def test_returns_all_extension_points():
     _parser, ext = _build()
     assert isinstance(ext, GenericCommandExtensionPoints)
-    for field in ("record_sub", "wallet_sub", "wallet_movement_sub", "wizard_sub", "sheet_sub"):
+    for field in (
+        "record_sub", "wallet_sub", "wallet_movement_sub", "wizard_sub", "sheet_sub",
+        "creditcard_sub", "show_parser",
+    ):
         assert getattr(ext, field) is not None
 
 
@@ -47,6 +50,12 @@ def test_returns_all_five_extension_points():
     ["wallet", "edit", "--wallet", "x"],
     ["wallet", "movement", "add", "--wallet", "x", "--row", "y", "--amount", "1"],
     ["wallet", "movement", "undo", "--movement-id", "1"],
+    ["show"],
+    ["show", "--with-real", "--wallets"],
+    ["creditcard", "list"],
+    ["creditcard", "edit", "--card", "x"],
+    ["creditcard", "cupo"],
+    ["creditcard", "map", "--card", "x", "--sheet-id", "1", "--row", "y"],
 ])
 def test_every_generic_command_parses(argv):
     parser, _ext = _build()
@@ -59,6 +68,7 @@ def test_every_generic_command_parses(argv):
     ["wizard"],
     ["wallet"],
     ["wallet", "movement"],
+    ["creditcard"],
 ])
 def test_split_groups_have_no_app_specific_children_yet(argv):
     # record/history, wallet/add, wallet-movement/list, wizard/new, and every
@@ -79,9 +89,22 @@ def test_extension_points_accept_a_consuming_apps_own_children():
     ext.wallet_movement_sub.add_parser("list", help="app-specific, added by a consumer")
     ext.wizard_sub.add_parser("new", help="app-specific, added by a consumer")
     ext.sheet_sub.add_parser("create", help="app-specific, added by a consumer")
+    ext.creditcard_sub.add_parser("add", help="app-specific, added by a consumer")
+    ext.show_parser.add_argument("--cards", action="store_true")
+    ext.show_parser.add_argument("--bridge", action="store_true")
     # Re-parsing the same argv now succeeds since the child was added.
     parser2 = argparse.ArgumentParser()
     sub2 = parser2.add_subparsers(dest="command", required=True)
     ext2 = register_generic_commands(sub2)
     ext2.wizard_sub.add_parser("new")
     parser2.parse_args(["wizard", "new"])
+
+
+def test_show_parser_is_the_actual_show_parser():
+    # ext.show_parser is the SAME parser "show" itself uses -- adding a flag
+    # onto it must show up when parsing the top-level "show" command, not
+    # just on some detached copy.
+    parser, ext = _build()
+    ext.show_parser.add_argument("--cards", action="store_true")
+    args = parser.parse_args(["show", "--cards"])
+    assert args.cards is True

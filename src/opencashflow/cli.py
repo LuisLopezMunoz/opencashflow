@@ -15,8 +15,9 @@ calls it once, then adds its own app-specific children/commands onto the
 same parser tree. Since v0.8.1, this module ALSO has its own standalone
 `main()`/`if __name__` (see "Entry point" near the end of this file) --
 installed as the `opencashflow` console script -- independent of any
-consuming app: no ledger, no credit cards, no multi-user auth, just this
-module's own generic surface plus a minimal `seed`. It exists so
+consuming app: no ledger, no multi-user auth, just this module's own
+generic surface (which now includes basic credit card tracking) plus a
+minimal `seed`. It exists so
 `register_generic_commands` is runnable and testable on its own, and so
 the library has a copy-pasteable demo that doesn't require a consuming
 app (see docs/examples/).
@@ -43,6 +44,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from opencashflow.cli_export import export_csv, export_xlsx
+from opencashflow.credit_card import CreditCard
+from opencashflow.creditcard_statements import (
+    _cupo_disponible_detail,
+    _cupo_disponible_real_ahora,
+    resolve_credit_card,
+)
 from opencashflow.engine import (
     build_sum_rows_hierarchy as _build_sum_rows_hierarchy,
     compute_sheet,
@@ -1886,10 +1893,281 @@ def cmd_available(db, args) -> None:
             print(f"    {name}")
 
 
-# _bridge_cards_for_period/_compute_real_column_values now live in
-# backend/bridge_financing.py (imported above) -- draw_for_deficit needs
-# the real SALDO FINAL too, to detect a deficit against reality instead
-# of only the projected column.
+def compute_real_column_values(
+    db, sheet: CashflowSheet, result: Dict, period_id: int, today: Optional[date] = None,
+    *, extra_cash=None,
+) -> Tuple[Dict[int, Optional[Decimal]], List[Tuple[str, Decimal, bool]]]:
+    """For ONE period, what each row would show if reality (accrued/paid,
+    written by `record set`/wallet movements/statement syncs) replaces
+    whatever is still just projected -- the "show me this next to lo
+    proyectado" view `show --with-real` renders as an extra column.
+    Returns (values_by_row_id, balance_breakdown) -- the second is how
+    SALDO INICIAL's single number in the first was actually built, always
+    printed alongside it (a figure nobody can see the components of
+    doesn't get trusted, and shouldn't).
+
+    Two different conventions on purpose, not one:
+
+      - SALDO INICIAL (the balance row) becomes "cuánta caja tengo AHORA",
+        caja sourced in this priority order (never blended, the first that
+        applies wins outright):
+          1. The sum of the sheet owner's Wallet balances IN THE SHEET'S
+             OWN CURRENCY (a wallet in a different currency is simply not
+             this sheet's cash and is left out, never converted or mixed
+             in) -- the most direct source of truth once wallets exist at
+             all: "this is what the bank/your pocket says right now."
+          2. Else a directly-confirmed SheetCell.actual_value on the
+             balance row (`record set --actual N`) -- the pre-wallets
+             mechanism, kept as a fallback for a sheet whose owner hasn't
+             set up any wallet yet.
+          3. Else the projected starting balance plus every OTHER row's
+             paid_value so far (sign-weighted via effective_sign_to_top)
+             as a rough estimate -- clearly labeled as an estimate in the
+             breakdown, never presented as if confirmed.
+        Plus whatever `extra_cash` (see below) contributes on top.
+      - Every other row becomes "lo que todavía falta resolver de esta
+        línea": accrued - paid (never negative) when accrued is known;
+        else projected - paid (never negative) when only paid is known --
+        a partial payment/collection with no accrued confirmed yet still
+        shows the correct remainder instead of being treated as fully
+        resolved; else the row's own projected value unchanged if nothing
+        has been recorded at all yet (100% still to happen, same as the
+        projected column already shows).
+      - Every subtotal/total row (Total Ingresos, ..., FLUJO NETO, SALDO
+        FINAL) recomputes by summing its own sum_rows children's REAL
+        values with the exact same signs the projected column already
+        uses -- computed bottom-up/memoized since a total can itself be a
+        sum_rows child of another total.
+
+    `extra_cash`, when given, is called as
+    `extra_cash(db, sheet, period_id, today, caja_is_estimated=...)` once
+    caja_real is known to be not-None, and must return a list of
+    (label, amount, is_estimate) triples -- each added on top of caja_real
+    into SALDO INICIAL's real value and appended to balance_breakdown.
+    `caja_is_estimated` tells the callback whether caja_real itself came
+    from the roughest fallback (3, above) rather than a real wallet/
+    confirmed actual_value -- a callback that would otherwise double-count
+    something already folded into that estimate (e.g. a paid_value on some
+    other row) can use this to skip itself. This is the seam a consuming
+    app uses to fold in something this package doesn't know about (e.g.
+    credit card cupo, or a cash-equivalent financing receipt) without this
+    function needing to know what that something is.
+    """
+    today = today or date.today()
+    rows_by_id, child_to_parent = _build_sum_rows_hierarchy(db, sheet.id)
+    balance_row = _find_balance_row_or_raise(db, sheet.id)
+
+    cr_by_row_id: Dict[int, Any] = {}
+    for section in result["sections"]:
+        for row_data in section["rows"]:
+            row = row_data["row"]
+            for cr in row_data["cells"]:
+                if cr.period_id == period_id:
+                    cr_by_row_id[row.id] = cr
+
+    balance_cr = cr_by_row_id.get(balance_row.id)
+    balance_projected = balance_cr.projected_value if balance_cr is not None else None
+
+    balance_breakdown: List[Tuple[str, Decimal, bool]] = []
+    sheet_currency = (sheet.currency or "").upper()
+    wallets = (
+        db.query(Wallet).filter(Wallet.user_id == sheet.user_id, Wallet.currency == sheet_currency)
+        .order_by(Wallet.id).all()
+        if sheet_currency else []
+    )
+    caja_is_estimated = False
+    if wallets:
+        # Preferido sobre TODO lo demás: una billetera es la fuente de
+        # verdad más directa posible ("esto es lo que el banco/tu bolsillo
+        # dice ahora mismo"), reemplazando por completo el mecanismo viejo
+        # de `record set --actual` en la fila de saldo -- ese registro
+        # queda intacto en el historial (nunca se edita el pasado), solo
+        # deja de ser la fuente ACTIVA en cuanto existe al menos una
+        # billetera en la misma moneda de la planilla.
+        caja_real = Decimal(0)
+        for w in wallets:
+            caja_real += w.balance
+            balance_breakdown.append((f"Billetera: {w.name}", w.balance, False))
+    elif balance_cr is not None and balance_cr.actual_value is not None:
+        caja_real = balance_cr.actual_value
+        balance_breakdown.append(("Caja (cuenta corriente, confirmada)", caja_real, False))
+    else:
+        realized_delta = Decimal(0)
+        for row_id, cr in cr_by_row_id.items():
+            if row_id == balance_row.id or rows_by_id[row_id].row_type in _AGGREGATE_ROW_TYPES:
+                continue
+            if cr.paid_value is None:
+                continue
+            multiplier = _effective_sign_to_top(row_id, rows_by_id, child_to_parent)
+            if multiplier is not None:
+                realized_delta += multiplier * cr.paid_value
+        caja_real = balance_projected + realized_delta if balance_projected is not None else None
+        caja_is_estimated = True
+        if caja_real is not None:
+            balance_breakdown.append((
+                "Caja (estimada -- sin confirmar, usa 'record set --row <saldo inicial> --actual N')",
+                caja_real, True,
+            ))
+
+    saldo_inicial_real = caja_real
+    if extra_cash is not None and caja_real is not None:
+        for label, amount, is_estimate in extra_cash(db, sheet, period_id, today, caja_is_estimated=caja_is_estimated):
+            saldo_inicial_real += amount
+            balance_breakdown.append((label, amount, is_estimate))
+
+    def leaf_value(row_id: int) -> Optional[Decimal]:
+        cr = cr_by_row_id.get(row_id)
+        if cr is None:
+            return None
+        if cr.accrued_value is not None:
+            remaining = cr.accrued_value - (cr.paid_value if cr.paid_value is not None else Decimal(0))
+            return remaining if remaining > 0 else Decimal(0)
+        if cr.paid_value is not None:
+            if cr.projected_value is None:
+                return Decimal(0)
+            remaining = cr.projected_value - cr.paid_value
+            return remaining if remaining > 0 else Decimal(0)
+        return cr.projected_value
+
+    cache: Dict[int, Optional[Decimal]] = {}
+    visiting: set = set()
+
+    def real_value(row_id: int) -> Optional[Decimal]:
+        if row_id in cache:
+            return cache[row_id]
+        if row_id == balance_row.id:
+            cache[row_id] = saldo_inicial_real
+            return saldo_inicial_real
+        if row_id in visiting:
+            raise ValueError(f"Ciclo detectado calculando la columna real en la fila #{row_id}.")
+        visiting.add(row_id)
+        row = rows_by_id[row_id]
+        rule = row.default_projection_rule
+        if rule and rule.get("type") == "sum_rows":
+            total = Decimal(0)
+            any_value = False
+            for cid in rule.get("row_ids", []):
+                if cid not in rows_by_id:
+                    continue
+                v = real_value(cid)
+                if v is not None:
+                    total += _row_sign_multiplier(rows_by_id[cid]) * v
+                    any_value = True
+            value = total if any_value else None
+        else:
+            value = leaf_value(row_id)
+        visiting.discard(row_id)
+        cache[row_id] = value
+        return value
+
+    values = {row_id: real_value(row_id) for row_id in rows_by_id}
+    return values, balance_breakdown
+
+
+def cmd_show(
+    db, args, *, result=None, extra_real_cash=None, extra_combined_total=None, print_extra_sections=None,
+) -> None:
+    """Mostrar la matriz calculada de una planilla como tabla.
+
+    Extension points (mismo patrón que cmd_export usa para `result=None`):
+      - `result`: si se pasa, se usa en vez de llamar a compute_sheet() --
+        para que una app consumidora inyecte una proyección ya calculada
+        (p. ej. anclada en el saldo real de hoy) sin que este comando
+        necesite saber cómo se construyó.
+      - `extra_real_cash`: pasado tal cual como `extra_cash` a
+        compute_real_column_values (ver esa función) -- solo se usa si
+        `--with-real` está activo.
+      - `extra_combined_total(db, sheet, sheet_currency) -> Optional[Decimal]`:
+        un total adicional (p. ej. cupo de tarjetas) a sumar sobre el total
+        de billeteras para el paréntesis informativo bajo SALDO INICIAL
+        (ver _render_table) -- deliberadamente SEPARADO de lo que
+        compute_real_column_values ya suma en la columna real, ese
+        paréntesis es puramente informativo y nunca alimenta SALDO FINAL/
+        FLUJO NETO.
+      - `print_extra_sections(db, sheet, args)`: si se pasa, se llama antes
+        de imprimir la tabla -- para que una app consumidora imprima
+        secciones propias (p. ej. TARJETAS si args.cards) sin que este
+        comando necesite saber qué son.
+    """
+    sheet = _pick_sheet(db, args.sheet_id)
+    if result is None:
+        result = compute_sheet(sheet.id, db)
+    all_periods = result["periods"]
+    if not all_periods:
+        print(f"La planilla #{sheet.id} no tiene períodos.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.with_real and args.format == "csv":
+        print("--with-real todavía no está soportado con --format csv.", file=sys.stderr)
+        sys.exit(1)
+
+    # Ventana anclada en "hoy", estilo grep -A/-B/-C: por default se muestra el
+    # período actual + los N siguientes proyectados (--months, alias de
+    # --after), nunca "los primeros N por sort_order" -- eso mostraba historia
+    # vieja en vez del período en curso en cuanto una planilla tenía historial
+    # (ver periods.find_anchor_period).
+    anchor = find_anchor_period(all_periods)
+    after = args.context if args.context is not None else args.months
+    before = args.context if args.context is not None else args.before
+    anchor_idx = all_periods.index(anchor)
+    start = max(0, anchor_idx - before)
+    end = min(len(all_periods), anchor_idx + after + 1)
+    periods = all_periods[start:end]
+
+    if args.format == "csv":
+        _render_csv(sheet, result, periods, args.unit)
+        return
+
+    # --wallets es opt-in para el bloque STANDALONE únicamente (alguien que
+    # solo quiere la tabla no necesita 8 líneas extra arriba) -- el total en
+    # sí siempre se calcula para que el paréntesis inline bajo SALDO INICIAL
+    # lo muestre igual.
+    if args.wallets:
+        _print_wallets_section(db, sheet.user_id, args.unit)
+    if print_extra_sections is not None:
+        print_extra_sections(db, sheet, args)
+
+    real_values = None
+    real_label = None
+    balance_breakdown = None
+    balance_row_id = None
+    combined_total = None
+    if args.with_real:
+        if "forecast_actual" in result:
+            real_values = result["forecast_actual"]
+            balance_breakdown = result["forecast_breakdown"]
+            for section in result["sections"]:
+                for row in section["rows"]:
+                    row["cells"] = [
+                        result["forecast_planned"][row["row"].id] if c.period_id == anchor.id else c
+                        for c in row["cells"]
+                    ]
+        else:
+            try:
+                real_values, balance_breakdown = compute_real_column_values(
+                    db, sheet, result, anchor.id, extra_cash=extra_real_cash,
+                )
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(1)
+        real_label = "Actual"
+        sheet_currency = (sheet.currency or "").upper()
+        wallets_total = _wallets_total_for_currency(db, sheet.user_id, sheet_currency)
+        extra_total = extra_combined_total(db, sheet, sheet_currency) if extra_combined_total is not None else None
+        if wallets_total is not None or extra_total is not None:
+            combined_total = (wallets_total or Decimal(0)) + (extra_total or Decimal(0))
+            balance_row_id = _find_balance_row(db, sheet.id).id
+    if "forecast_anchor_id" in result:
+        print(
+            "Proyección desde Actual: caja disponible y cobros/pagos pendientes; los meses "
+            "siguientes arrastran ese cierre.\n"
+        )
+    _render_table(
+        sheet, result, periods, unit=args.unit, width=args.width, show_ids=args.show_ids,
+        anchor_period_id=anchor.id, real_values=real_values, real_label=real_label,
+        balance_row_id=balance_row_id, combined_total=combined_total,
+        balance_breakdown=balance_breakdown,
+    )
 
 
 
@@ -2199,6 +2477,197 @@ def _print_wallets_section(db, user_id: int, unit: str) -> None:
             desc = f"  ({w.description})" if w.description else ""
             print(f"    [{w.id}] {w.name} ({w.wallet_type}): {_fmt_number(w.balance, unit)}{desc}")
     print()
+
+
+
+
+# ---------------------------------------------------------------------------
+# Credit cards -- basic model + cupo (list/edit/cupo/map). `add` (and
+# everything charge/statement/sync/bridge-shaped) stays app-specific, same
+# reason `wallet add` does: it resolves an owner via --username/interactive
+# fallback (see a consuming app's own _resolve_sheet_owner), which this
+# generic surface has no equivalent for.
+# ---------------------------------------------------------------------------
+
+_CARD_STATUS_CHOICES = ["active", "expired", "blocked", "cancelled"]
+
+
+def _resolve_creditcard_or_exit(db, card_arg: str) -> CreditCard:
+    try:
+        return resolve_credit_card(db, None, card_arg)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_creditcard_list(db, args) -> None:
+    query = db.query(CreditCard)
+    if args.user_id is not None:
+        query = query.filter(CreditCard.user_id == args.user_id)
+    cards = query.order_by(CreditCard.id).all()
+
+    if not cards:
+        print("No hay tarjetas de crédito registradas.")
+        return
+
+    for card in cards:
+        mapping = (
+            f"planilla #{card.mapped_sheet_id} / fila #{card.mapped_row_id}"
+            if card.mapped_sheet_id is not None and card.mapped_row_id is not None
+            else "(sin mapear -- corre 'creditcard map')"
+        )
+        card_text = f"**** {card.last4}" if card.last4 else "(sin dígitos guardados)"
+        expiration_text = card.expiration_date.strftime("%m/%y") if card.expiration_date else "(sin fecha)"
+        estado = f"  [estado={card.status}]" if card.status != "active" else ""
+        print(
+            f"[{card.id}] {card.name}  banco={card.bank or '(sin banco)'}  {card_text}  vence={expiration_text}  "
+            f"cupo={_fmt_number(Decimal(str(card.credit_limit)), '1')}  moneda={card.currency}  "
+            f"cierre=día {card.closing_day}  vencimiento=día {card.due_day}  "
+            f"usuario_id={card.user_id}  mapeo={mapping}{estado}"
+        )
+
+
+def _do_edit_card(
+    db, card: CreditCard, *,
+    name=_UNSET, bank=_UNSET, credit_limit=_UNSET, closing_day=_UNSET, due_day=_UNSET,
+    interest_rate=_UNSET, minimum_payment_rate=_UNSET, currency=_UNSET,
+    last4=_UNSET, expiration_date=_UNSET, network=_UNSET, holder_name=_UNSET, status=_UNSET,
+) -> Dict[str, Tuple]:
+    """Partial update of `card`: only fields actually passed (not left at
+    the _UNSET default -- the same sentinel _do_edit_row uses) are
+    considered, and only ones that actually change something are applied --
+    same pattern as _do_edit_row. Commits only if something actually
+    changed."""
+    fields = {
+        "name": name, "bank": bank, "credit_limit": credit_limit, "closing_day": closing_day, "due_day": due_day,
+        "interest_rate": interest_rate, "minimum_payment_rate": minimum_payment_rate, "currency": currency,
+        "last4": last4, "expiration_date": expiration_date, "network": network, "holder_name": holder_name,
+        "status": status,
+    }
+    changes: Dict[str, Tuple] = {}
+    for field_name, value in fields.items():
+        if value is _UNSET:
+            continue
+        old = getattr(card, field_name)
+        if value != old:
+            changes[field_name] = (old, value)
+            setattr(card, field_name, value)
+    if changes:
+        db.commit()
+        db.refresh(card)
+    return changes
+
+
+def cmd_creditcard_edit(db, args) -> None:
+    card = _resolve_creditcard_or_exit(db, args.card)
+
+    kwargs = {}
+    if args.name is not None:
+        kwargs["name"] = args.name
+    if args.bank is not None:
+        kwargs["bank"] = args.bank
+    if args.credit_limit is not None:
+        kwargs["credit_limit"] = args.credit_limit
+    if args.closing_day is not None:
+        kwargs["closing_day"] = args.closing_day
+    if args.due_day is not None:
+        kwargs["due_day"] = args.due_day
+    if args.interest_rate is not None:
+        kwargs["interest_rate"] = args.interest_rate
+    if args.minimum_payment_rate is not None:
+        kwargs["minimum_payment_rate"] = args.minimum_payment_rate
+    if args.currency is not None:
+        kwargs["currency"] = args.currency.upper()
+    if args.last4 is not None:
+        kwargs["last4"] = args.last4
+    if args.expiration is not None:
+        kwargs["expiration_date"] = _parse_base_period(args.expiration)
+    if args.network is not None:
+        kwargs["network"] = args.network
+    if args.holder_name is not None:
+        kwargs["holder_name"] = args.holder_name
+    if args.status is not None:
+        kwargs["status"] = args.status
+
+    changes = _do_edit_card(db, card, **kwargs)
+    if not changes:
+        print(f"Sin cambios para la tarjeta '{card.name}' [{card.id}].")
+        return
+    print(f"[OK] Tarjeta '{card.name}' [{card.id}] actualizada:")
+    for field_name, (old, new) in changes.items():
+        print(f"  {field_name}: {old} -> {new}")
+
+
+def cmd_creditcard_map(db, args) -> None:
+    card = _resolve_creditcard_or_exit(db, args.card)
+    sheet = _pick_sheet(db, args.sheet_id)
+    row = _resolve_row(db, sheet.id, args.row)
+
+    old_mapping = (
+        f"planilla #{card.mapped_sheet_id} / fila #{card.mapped_row_id}"
+        if card.mapped_sheet_id is not None and card.mapped_row_id is not None
+        else "(sin mapear)"
+    )
+    card.mapped_sheet_id = sheet.id
+    card.mapped_row_id = row.id
+    db.commit()
+
+    print(
+        f"[OK] Tarjeta '{card.name}' [{card.id}] mapeada a planilla #{sheet.id} ('{sheet.name}') / "
+        f"fila [{row.id}] {row.section.name} > {row.name}  (antes: {old_mapping})"
+    )
+
+
+def cmd_creditcard_cupo(db, args) -> None:
+    """Dos cifras a propósito nunca mezcladas en una sola:
+
+      - 'Real ahora': lo que el banco te mostraría hoy mismo -- si el
+        último ciclo cerrado todavía no está pagado (según el `record`
+        real de la fila mapeada, no una suposición), ese monto sigue
+        ocupando cupo.
+      - 'Para planificar': una cifra pareja que asume que el ciclo recién
+        cerrado YA se pagó -- la disciplina que cualquier estrategia de
+        financiamiento sobre cupo disponible exige para no ofrecer el
+        mismo cupo dos veces.
+
+    Confundir estas dos fue justamente el origen de una confusión real:
+    'Real ahora' puede (y va a) mostrar un número más bajo, incluso
+    negativo (sobregiro), mientras el total facturado del ciclo siga sin
+    pagarse -- eso no es un error, es exactamente lo que hoy dice el banco.
+    """
+    today = date.today()
+    if args.card:
+        cards = [_resolve_creditcard_or_exit(db, args.card)]
+    else:
+        cards = db.query(CreditCard).filter(CreditCard.mapped_row_id.isnot(None)).order_by(CreditCard.id).all()
+        if not cards:
+            print(
+                "No hay tarjetas mapeadas a una planilla -- usa --card para consultar una tarjeta específica.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    for card in cards:
+        try:
+            real_now, real_is_estimate = _cupo_disponible_real_ahora(db, card, today)
+            plan_cupo, plan_is_estimate = _cupo_disponible_detail(db, card, today)
+        except ValueError as e:
+            print(f"[{card.name}] {e}", file=sys.stderr)
+            continue
+        real_tag = " (estimado)" if real_is_estimate else ""
+        plan_tag = " (estimado)" if plan_is_estimate else ""
+        estado = f"  [estado={card.status} -- no usable para gastos nuevos]" if card.status != "active" else ""
+        print(f"{card.name} [{card.id}]:{estado}")
+        real_text = _fmt_number(real_now, args.unit)
+        plan_text = _fmt_number(plan_cupo, args.unit)
+        print(f"  Real ahora{real_tag}:       {_c(real_text, 'red') if real_now < 0 else real_text}")
+        print(f"  Para planificar{plan_tag}:  {_c(plan_text, 'red') if plan_cupo < 0 else plan_text}")
+    print(
+        "\n  'Real ahora' = lo que el banco muestra hoy (el ciclo recién facturado sigue ocupando cupo si "
+        "no está pagado de verdad).\n"
+        "  'Para planificar' = una cifra pareja que asume el ciclo recién cerrado ya pagado (para no "
+        "ofrecer el mismo cupo dos veces)."
+    )
 
 
 
@@ -2771,24 +3240,33 @@ def cmd_wizard_edit(db, args) -> None:
 
 @dataclasses.dataclass
 class GenericCommandExtensionPoints:
-    """Sub-subparser objects for the FIVE command groups that are split
-    between this module's generic commands and a consuming app's own
-    app-specific ones (e.g. anything coupled to a private `User`/auth
-    model). register_generic_commands creates each of these groups'
-    parent parser and registers only its generic children, then hands
-    back the group's own argparse subparsers object so the consuming app
-    can call .add_parser(...) on it directly to add its remaining,
+    """Sub-subparser objects (plus one bare command parser) for the command
+    groups split between this module's generic commands and a consuming
+    app's own app-specific ones (e.g. anything coupled to a private
+    `User`/auth model). register_generic_commands creates each of these
+    groups' parent parser and registers only its generic children, then
+    hands back the group's own argparse subparsers object so the consuming
+    app can call .add_parser(...) on it directly to add its remaining,
     app-specific children -- record/history, wallet/add,
-    wallet-movement/list, wizard/new, and sheet/create (plus whatever
-    else an app wants to hang under these same groups) all get wired
-    this way, onto the SAME parent group, rather than as unrelated
-    top-level commands."""
+    wallet-movement/list, wizard/new, sheet/create, and creditcard/add
+    (plus whatever else an app wants to hang under these same groups) all
+    get wired this way, onto the SAME parent group, rather than as
+    unrelated top-level commands.
+
+    `show_parser` is the odd one out: `show` has no subcommands to split,
+    only FLAGS -- `--cards`/`--bridge` are card/bridge-financing-specific
+    and stay app-only, so register_generic_commands registers every OTHER
+    `show` flag and hands back the parser itself (not a subparsers object)
+    so a consuming app can `.add_argument(...)` its own flags onto the
+    exact same parser."""
 
     record_sub: Any
     wallet_sub: Any
     wallet_movement_sub: Any
     wizard_sub: Any
     sheet_sub: Any
+    creditcard_sub: Any
+    show_parser: Any
 
 
 def register_generic_commands(sub) -> GenericCommandExtensionPoints:
@@ -3051,12 +3529,86 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
     p_wm_undo.add_argument("--note", type=str, default=None)
     p_wm_undo.add_argument("--user-id", type=int, default=None)
 
+    # "show" has no subcommands to split -- only flags. --cards/--bridge stay
+    # app-only (see GenericCommandExtensionPoints' own docstring); every
+    # other flag is registered here, and the parser itself is handed back
+    # so a consuming app adds its own flags onto it directly.
+    p_show = sub.add_parser("show", help="Mostrar la matriz calculada de una planilla como tabla")
+    p_show.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_show.add_argument("--months", type=int, default=6,
+                         help="Cuántos períodos proyectados mostrar después del actual (default: 6, alias de --after)")
+    p_show.add_argument("--before", type=int, default=0, help="Cuántos períodos históricos mostrar antes del actual")
+    p_show.add_argument("--context", type=int, default=None,
+                         help="Atajo para --before N --after N a la vez (estilo grep -C)")
+    p_show.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
+    p_show.add_argument("--width", type=int, default=None, help="Ancho de terminal asumido (default: autodetectar)")
+    p_show.add_argument("--format", choices=["table", "csv"], default="table")
+    p_show.add_argument("--show-ids", action="store_true", help="Prefijar cada fila con su row_id")
+    p_show.add_argument(
+        "--with-real", action="store_true",
+        help="Agrega una columna extra junto al período actual con los valores actualizados "
+             "(caja real / lo que falta por resolver) en vez de solo lo proyectado; solo con --format table",
+    )
+    p_show.add_argument(
+        "--wallets", action="store_true",
+        help="Muestra el detalle por billetera, no solo el total (el total ya se muestra siempre que existan)",
+    )
+
+    # "creditcard" is split: list/edit/cupo/map are generic (registered
+    # here); "add" (owner resolution via --username/interactive fallback,
+    # same reason "wallet add" stays app-only) and anything charge/
+    # statement/sync/bridge-shaped are app-specific -- a consuming app adds
+    # them onto creditcard_sub.
+    p_creditcard = sub.add_parser("creditcard", help="Operaciones sobre tarjetas de crédito")
+    creditcard_sub = p_creditcard.add_subparsers(dest="creditcard_command", required=True)
+
+    p_cc_list = creditcard_sub.add_parser("list", help="Listar tarjetas de crédito")
+    p_cc_list.add_argument("--user-id", type=int, default=None, help="Filtrar por dueño (default: todas)")
+
+    p_cc_cupo = creditcard_sub.add_parser(
+        "cupo", help="Cupo disponible real ahora (lo que muestra el banco) vs. para planificar",
+    )
+    p_cc_cupo.add_argument(
+        "--card", type=str, default=None,
+        help="Nombre (o parte) o id de la tarjeta (default: todas las mapeadas a una planilla)",
+    )
+    p_cc_cupo.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
+
+    p_cc_edit = creditcard_sub.add_parser("edit", help="Editar una tarjeta existente (actualización parcial)")
+    p_cc_edit.add_argument("--card", type=str, required=True, help="Nombre (o parte) o id de la tarjeta")
+    p_cc_edit.add_argument("--name", type=str, default=None)
+    p_cc_edit.add_argument("--bank", type=str, default=None)
+    p_cc_edit.add_argument("--credit-limit", type=float, default=None)
+    p_cc_edit.add_argument("--closing-day", type=int, default=None)
+    p_cc_edit.add_argument("--due-day", type=int, default=None)
+    p_cc_edit.add_argument("--interest-rate", type=float, default=None)
+    p_cc_edit.add_argument("--minimum-payment-rate", type=float, default=None)
+    p_cc_edit.add_argument("--currency", type=str, default=None)
+    p_cc_edit.add_argument("--last4", type=str, default=None, help="Últimos 4 dígitos (nunca el número completo)")
+    p_cc_edit.add_argument("--expiration", type=str, default=None, help="Mes YYYY-MM impreso en la tarjeta")
+    p_cc_edit.add_argument("--network", type=str, default=None, help="Marca: Visa, Mastercard, Amex, etc.")
+    p_cc_edit.add_argument("--holder-name", type=str, default=None, help="Nombre del titular impreso")
+    p_cc_edit.add_argument(
+        "--status", choices=_CARD_STATUS_CHOICES, default=None,
+        help="active: puede recibir cargos nuevos. expired/blocked/cancelled: se rechazan cargos nuevos "
+             "(su deuda ya existente se sigue sincronizando/pagando igual)",
+    )
+
+    p_cc_map = creditcard_sub.add_parser(
+        "map", help="Asociar una tarjeta a la fila de una planilla donde se sincroniza su 'total a pagar'",
+    )
+    p_cc_map.add_argument("--card", type=str, required=True, help="Nombre (o parte) o id de la tarjeta")
+    p_cc_map.add_argument("--sheet-id", type=int, required=True)
+    p_cc_map.add_argument("--row", type=str, required=True, help="Nombre (o parte) o id de la fila")
+
     return GenericCommandExtensionPoints(
         record_sub=record_sub,
         wallet_sub=wallet_sub,
         wallet_movement_sub=wallet_movement_sub,
         wizard_sub=wizard_sub,
         sheet_sub=sheet_sub,
+        creditcard_sub=creditcard_sub,
+        show_parser=p_show,
     )
 
 
@@ -3070,9 +3622,12 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
 # richer seed command). Useful for trying the engine out, running the
 # docs/examples demo, or exercising register_generic_commands end to end
 # without any consuming app -- NOT meant to replace a real app's own CLI
-# (there is no ledger, no credit cards, no bridge financing, no
+# (there is no ledger, no bank-statement PDF import or bridge financing, no
 # multi-user auth here, and its default database is a throwaway sandbox
-# file, never a real app's own database).
+# file, never a real app's own database). Basic credit card tracking
+# (list/edit/cupo/map) IS part of the generic surface -- but note there's
+# no standalone `creditcard add` either (same reason there's no standalone
+# `wallet add`: both need a consuming app's own owner-resolution fallback).
 
 
 def _default_db_url() -> str:
@@ -3161,6 +3716,8 @@ def main() -> None:
             cmd_export(db, args)
         elif args.command == "available":
             cmd_available(db, args)
+        elif args.command == "show":
+            cmd_show(db, args)
         elif args.command == "period":
             if args.period_command == "close":
                 cmd_period_close(db, args)
@@ -3177,6 +3734,15 @@ def main() -> None:
                     cmd_wallet_movement_add(db, args)
                 elif args.wallet_movement_command == "undo":
                     cmd_wallet_movement_undo(db, args)
+        elif args.command == "creditcard":
+            if args.creditcard_command == "list":
+                cmd_creditcard_list(db, args)
+            elif args.creditcard_command == "edit":
+                cmd_creditcard_edit(db, args)
+            elif args.creditcard_command == "cupo":
+                cmd_creditcard_cupo(db, args)
+            elif args.creditcard_command == "map":
+                cmd_creditcard_map(db, args)
     finally:
         db.close()
 

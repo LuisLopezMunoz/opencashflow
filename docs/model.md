@@ -248,30 +248,79 @@ movimientos son, igual que `CellActualEntry`, un log de solo-inserción.
 
 Migrado desde la app privada (2026-09-05): CRUD de planilla/sección/fila, el renderizador de
 tabla (`show`), lectura/escritura de `record`/`override`, `available`, `period close`,
-`wallet [movement]`, exportar a CSV/XLSX, y el wizard interactivo — todo lo que no depende de
-ningún concepto bancario/Chileno ni de un modelo de usuario/auth (esas partes se quedaron en
-la app consumidora). Son funciones "con forma de comando" (reciben `args`/`db`, imprimen a
-stdout).
+`wallet [movement]`, tarjetas de crédito básicas (`creditcard list/edit/cupo/map`, ver más
+abajo), exportar a CSV/XLSX, y el wizard interactivo — todo lo que no depende de ningún
+concepto bancario/Chileno específico ni de un modelo de usuario/auth (esas partes se
+quedaron en la app consumidora). Son funciones "con forma de comando" (reciben `args`/`db`,
+imprimen a stdout).
 
 Desde v0.8.0, `register_generic_commands(sub)` arma el árbol de subparsers de argparse para
 TODOS los comandos genéricos de este módulo, y devuelve (`GenericCommandExtensionPoints`) el
 objeto subparsers de cada grupo que está partido entre hijos genéricos e hijos específicos de
-una app (`record`, `wallet`, `wallet movement`, `wizard`, `sheet`) — una app consumidora llama
-esta función una vez sobre su propio `parser.add_subparsers(...)` y después cuelga sus propios
-comandos (ej. `record history`, `wallet add`, `sheet create`) sobre esos mismos objetos, en vez
-de registrar todo por su cuenta.
+una app (`record`, `wallet`, `wallet movement`, `wizard`, `sheet`, `creditcard`) — una app
+consumidora llama esta función una vez sobre su propio `parser.add_subparsers(...)` y después
+cuelga sus propios comandos (ej. `record history`, `wallet add`, `sheet create`,
+`creditcard add`) sobre esos mismos objetos, en vez de registrar todo por su cuenta. Desde
+v0.11.0, `show` en sí también es un extension point, pero de un tipo distinto: no tiene
+subcomandos que partir, solo FLAGS -- `--cards`/`--bridge` son específicos de tarjetas/
+financiamiento puente y se quedan del lado de la app, así que `register_generic_commands`
+registra cada OTRA flag de `show` y devuelve el parser mismo (`show_parser`, no un objeto
+subparsers) para que una app consumidora le agregue las suyas directo con
+`.add_argument(...)`.
 
 Desde v0.8.1, este módulo TAMBIÉN tiene su propio `main()`/`if __name__` standalone,
 instalado como el script de consola `opencashflow` (`opencashflow seed`, `opencashflow
 rows`, etc., o `python -m opencashflow.cli`) — independiente de cualquier app consumidora:
-sin ledger, sin tarjetas de crédito, sin auth multiusuario, solo la superficie genérica de
-este módulo más un `seed` mínimo propio. Existe para que `register_generic_commands` sea
-ejecutable y probable por sí solo, y para que la librería tenga un demo copy-pasteable sin
-depender de ninguna app real. Una app consumidora sigue armando su propio `main()`/dispatch
-como siempre — `register_generic_commands` nunca despacha, solo arma el parser; el `main()`
-de este módulo es una alternativa standalone, no un reemplazo del de la app. Nota: `show`
-(el renderizador de tabla completo) NO está acá -- se quedó del lado de la app consumidora
-(ver la lista de funciones acopladas a `User` más arriba en esta sección).
+sin ledger, sin auth multiusuario, solo la superficie genérica de este módulo (que desde
+v0.11.0 incluye tarjetas de crédito básicas) más un `seed` mínimo propio. Existe para que
+`register_generic_commands` sea ejecutable y probable por sí solo, y para que la librería
+tenga un demo copy-pasteable sin depender de ninguna app real. Una app consumidora sigue
+armando su propio `main()`/dispatch como siempre — `register_generic_commands` nunca
+despacha, solo arma el parser; el `main()` de este módulo es una alternativa standalone, no
+un reemplazo del de la app.
+
+`cmd_show` tiene tres puntos de extensión para que una app consumidora inyecte lo que este
+paquete no puede conocer, sin que `cmd_show` necesite saber qué es cada cosa: `result`
+(un resultado ya calculado, ej. una proyección anclada en el saldo real de hoy, en vez de
+que `cmd_show` llame a `compute_sheet` por su cuenta -- mismo patrón que `cmd_export` ya usa
+para esto mismo), `extra_real_cash` (reenviado tal cual a `compute_real_column_values`, ver
+abajo) y `print_extra_sections(db, sheet, args)` (llamado antes de imprimir la tabla, para
+que una app imprima sus propias secciones -- ej. TARJETAS si `--cards`).
+
+`compute_real_column_values(db, sheet, result, period_id, today=None, *, extra_cash=None)`
+es la mitad genérica de lo que `show --with-real` muestra: resolución de caja (billeteras →
+`actual_value` confirmado → estimación derivada de `paid_value`) y la recursión
+`leaf_value`/`real_value` sobre la jerarquía `sum_rows`. `extra_cash`, si se pasa, se llama
+como `extra_cash(db, sheet, period_id, today, caja_is_estimated=...)` una vez que la caja
+base ya se sabe que no es `None`, y debe devolver una lista de `(etiqueta, monto,
+es_estimación)` -- cada una se suma a SALDO INICIAL y se agrega al desglose impreso. Esto es
+lo que le permite a una app consumidora sumar cupo de tarjetas o un financiamiento puente
+recibido sin que este paquete necesite saber qué es ninguna de las dos cosas.
+
+## Tarjetas de crédito (`opencashflow.credit_card`, `opencashflow.creditcard_statements`)
+
+Desde v0.11.0: el modelo básico de tarjeta de crédito (`CreditCard`, `CreditCardCharge`,
+`CreditCardStatement`, `CreditCardStatementLine`) y el seguimiento de cupo disponible
+(`cupo_disponible`/`_cupo_disponible_real_ahora`, la proyección de estado de cuenta
+`compute_instant_statement`, y `sync_period` para escribir el total a pagar de un ciclo en
+una celda) son parte del motor público -- son genéricos en el mismo sentido que `Wallet`:
+cualquier app de finanzas personales necesita esta misma noción de "tarjeta + cupo + cuotas".
+`user_id`/`created_by` son `Integer` planos, no `ForeignKey`, mismo criterio que
+`CashflowSheet.user_id`.
+
+Deliberadamente NO acá: el parseo de estados de cuenta en PDF específico de cada banco, y
+cualquier estrategia para decidir cuánto retirar de qué tarjeta para cubrir un déficit
+proyectado (rankear tarjetas, elegir entre ellas) -- eso es la estrategia financiera propia
+de una app consumidora, no algo que todo usuario de este paquete comparta.
+`_cupo_disponible_real_ahora`'s `exclude_category` existe justo para esta costura: una app
+que crea sus propios cargos sintéticos de "retiro planeado" (con una categoría propia)
+puede excluirlos del cupo real de hoy sin que este módulo necesite saber qué significa esa
+categoría.
+
+`register_generic_commands` registra `creditcard list/edit/cupo/map` (genéricos) y devuelve
+`creditcard_sub` para que una app cuelgue `add` (resolución de dueño vía `--username`/
+fallback interactivo, mismo motivo por el que `wallet add` también se queda del lado de la
+app) y cualquier cosa con forma `charge`/`statement`/`sync`/`bridge`.
 
 ## Sheet spec (`opencashflow.sheet_spec`)
 
