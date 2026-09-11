@@ -58,15 +58,17 @@ def guard_periods_not_closed(periods: List[SheetPeriod], action: str) -> None:
     """Raises ValueError naming every closed period in `periods`, phrased
     around `action` (e.g. "undo a record"), if any of them is_closed. A
     closed period's real values are meant to stay frozen -- see
-    opencashflow.period_close.close_period and SheetPeriod.is_closed's own
-    docstring for why this is a one-way flag with no reopen mechanism."""
+    opencashflow.period_close.close_period; to intentionally unfreeze one,
+    the caller should reach for opencashflow.period_close.reopen_period
+    instead of routing around this guard."""
     closed = [p for p in periods if p.is_closed]
     if closed:
         labels = ", ".join(p.label or p.period_date.strftime("%b-%y") for p in closed)
         raise ValueError(
             f"Cannot {action} on an already-closed period: {labels} -- a closed period's real "
             f"values are frozen at what was true when it closed; changing them afterward would "
-            f"desynchronize it. There is no mechanism to reopen a closed period."
+            f"desynchronize it. Call period_close.reopen_period on it first if you intend to "
+            f"reopen it, then retry."
         )
 
 

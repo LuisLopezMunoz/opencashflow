@@ -31,8 +31,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from opencashflow.engine import compute_sheet
-from opencashflow.models import Base, CashflowSheet, CellActualEntry, CellOverride, SheetCell, SheetPeriod, SheetRow, SheetSection
-from opencashflow.period_close import RolloverEntry, close_period
+from opencashflow.models import (
+    Base, CashflowSheet, CellActualEntry, CellOverride, SheetCell, SheetPeriod, SheetRow, SheetSection,
+    supersede_active_override, supersede_and_write_override,
+)
+from opencashflow.period_close import RolloverEntry, close_period, reopen_period
 
 TEST_DB_URL = "sqlite:///:memory:"
 TEST_USER_ID = 1
@@ -492,3 +495,206 @@ def test_exception_mid_write_leaves_the_database_unchanged(db, monkeypatch):
     period_after = _period(db, p0.id)
     assert period_after.is_closed is False
     assert _count_overrides(db) == overrides_before
+
+
+# ---------------------------------------------------------------------------
+# reopen_period -- previously close_period was one-way with no undo at all.
+# Deliberately narrow: only supersedes the frozen ending-balance override
+# and flips is_closed back, surfacing (not auto-reversing) anything else
+# the original close touched.
+# ---------------------------------------------------------------------------
+
+def test_reopen_restores_the_rows_own_rule_and_flips_is_closed(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[
+        {"name": "Sueldo", "rule": {"type": "constant", "value": 500_000}},
+    ])
+    (p0,) = (p.id for p in ids["periods"])
+    sueldo_id = ids["row_ids"]["Sueldo"]
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+    # Real paid is LESS than projected, so the frozen real ending balance
+    # (close_period's override) will differ from what the row's own rule
+    # would project -- makes the reopen's effect clearly observable.
+    _write_actual(db, sueldo_id, p0, accrued_value=500_000, paid_value=300_000)
+
+    close_report = close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+    assert close_report.saldo_final_value == Decimal("1300000")  # 1,000,000 + 300,000 real
+
+    sheet_id = ids["sheet_id"]
+    reopen_report = reopen_period(db, _sheet(db, sheet_id), _period(db, p0))
+    assert reopen_report.period_id == p0
+    assert reopen_report.touched_notes == []
+
+    period_after = _period(db, p0)
+    assert period_after.is_closed is False
+
+    # SALDO FINAL is no longer pinned at the frozen 1,300,000 -- it recomputes
+    # via its own sum_rows rule again: 1,000,000 + 500,000 (projected Sueldo).
+    result = compute_sheet(sheet_id, db)
+    saldo_final_id = ids["saldo_final_id"]
+    cell = next(
+        cr for section in result["sections"] for row_data in section["rows"]
+        if row_data["row"].id == saldo_final_id for cr in row_data["cells"] if cr.period_id == p0
+    )
+    assert cell.projected_value == Decimal("1500000")
+
+
+def test_reopen_raises_when_period_is_not_closed(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[])
+    (p0,) = (p.id for p in ids["periods"])
+    with pytest.raises(ValueError, match="not closed"):
+        reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0))
+
+
+def test_reopen_raises_when_a_later_period_is_already_closed(db):
+    ids = _build_sheet(db, months=2, leaf_rows=[])
+    p0, p1 = (p.id for p in ids["periods"])
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+    _seal_history_period(db, ids["saldo_final_id"], p0, 1_000_000)
+    close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p1), TEST_USER_ID)
+
+    with pytest.raises(ValueError, match="later period"):
+        reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0))
+
+
+def test_reopen_surfaces_touched_notes_from_backfill_and_rollover(db):
+    ids = _build_sheet(db, months=2, leaf_rows=[
+        {"name": "GastoFantasma", "sign": "negative", "rule": {"type": "constant", "value": 70_000}},
+    ])
+    p0, p1 = (p.id for p in ids["periods"])
+    gasto_id = ids["row_ids"]["GastoFantasma"]
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+
+    close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID,
+                 assume_unrecorded_as_pending=True)
+
+    reopen_report = reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0))
+    assert len(reopen_report.touched_notes) == 2
+    joined = " | ".join(reopen_report.touched_notes)
+    assert "GastoFantasma" in joined
+    assert "real entry recorded" in joined  # the assume_unrecorded_as_pending backfill
+    assert "override still active" in joined  # the rollover written onto p1
+
+    # The backfill/rollover themselves are untouched -- only surfaced.
+    assert _active_override_value(db, gasto_id, p1) == Decimal("140000")
+
+
+def test_reopen_dry_run_persists_nothing(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[
+        {"name": "Sueldo", "rule": {"type": "constant", "value": 500_000}},
+    ])
+    (p0,) = (p.id for p in ids["periods"])
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+    close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+    overrides_before = _count_overrides(db)
+
+    report = reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), dry_run=True)
+    assert report.dry_run is True
+
+    period_after = _period(db, p0)
+    assert period_after.is_closed is True  # unchanged -- dry run rolled back
+    assert _count_overrides(db) == overrides_before
+
+
+def test_reopen_then_reclose_round_trips_cleanly(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[
+        {"name": "Sueldo", "rule": {"type": "constant", "value": 500_000}},
+    ])
+    (p0,) = (p.id for p in ids["periods"])
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+    close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+
+    reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0))
+    # No real accrued/paid was ever recorded for Sueldo, so this second
+    # close correctly sees it as unrecorded (a warning, real_net_flow 0) --
+    # this test is about the round trip completing cleanly, not a specific
+    # figure (see test_reopen_restores_the_rows_own_rule_and_flips_is_closed
+    # for the case with real data recorded).
+    second_close = close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+
+    assert second_close.saldo_final_value == Decimal("1000000")
+    assert second_close.warnings == ["Sueldo"]
+    assert _period(db, p0).is_closed is True
+
+
+def test_reopen_does_not_surface_a_previous_periods_own_rollover(db):
+    """reopen_period(p1)'s touched_notes must never surface an override that
+    p0's OWN close wrote onto p1 as ITS rollover -- that's real
+    carried-forward financial history from p0's close, not "leftover mess"
+    from p1's own close. A single close/reopen (see
+    test_reopen_surfaces_touched_notes_from_backfill_and_rollover) can't
+    exercise this; it requires chaining two closes."""
+    ids = _build_sheet(db, months=3, leaf_rows=[
+        {"name": "GastoFantasma", "sign": "negative", "rule": {"type": "constant", "value": 70_000}},
+    ])
+    p0, p1, p2 = (p.id for p in ids["periods"])
+    gasto_id = ids["row_ids"]["GastoFantasma"]
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+
+    close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID,
+                 assume_unrecorded_as_pending=True)
+    assert _active_override_value(db, gasto_id, p1) == Decimal("140000")
+
+    close_report = close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p1), TEST_USER_ID)
+    assert close_report.warnings == ["GastoFantasma"]
+    assert close_report.rollovers == []
+
+    reopen_report = reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p1))
+
+    # The bug: touched_notes used to include p0's own rollover override
+    # (still active on p1's GastoFantasma cell) as if p1's close had made it.
+    assert reopen_report.touched_notes == []
+
+    # And it's untouched -- this is a reporting fix only, not a behavior
+    # change to what actually gets superseded.
+    assert _active_override_value(db, gasto_id, p1) == Decimal("140000")
+
+
+def test_reopen_raises_when_active_override_is_not_period_closes_own(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[
+        {"name": "Sueldo", "rule": {"type": "constant", "value": 500_000}},
+    ])
+    (p0,) = (p.id for p in ids["periods"])
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+    close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+
+    # Simulate drift: something else supersedes close_period's own frozen
+    # override with an unrelated one directly on the balance-final cell --
+    # e.g. cli.py's override set command, which didn't guard against closed
+    # periods until this same remediation pass (see the cli.py fix).
+    saldo_final_cell = db.query(SheetCell).filter(
+        SheetCell.row_id == ids["saldo_final_id"], SheetCell.period_id == p0
+    ).first()
+    supersede_and_write_override(
+        db, saldo_final_cell, Decimal("999999"), created_by=TEST_USER_ID,
+        note="manual correction, unrelated to close",
+    )
+    db.commit()
+
+    with pytest.raises(ValueError, match="does not look like"):
+        reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0))
+
+    # The guard fired before any write.
+    assert _period(db, p0).is_closed is True
+    assert _active_override_value(db, ids["saldo_final_id"], p0) == Decimal("999999")
+
+
+def test_reopen_raises_when_balance_final_cell_has_no_active_override(db):
+    ids = _build_sheet(db, months=1, leaf_rows=[
+        {"name": "Sueldo", "rule": {"type": "constant", "value": 500_000}},
+    ])
+    (p0,) = (p.id for p in ids["periods"])
+    _write_override(db, ids["saldo_inicial_id"], p0, 1_000_000)
+    close_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0), TEST_USER_ID)
+
+    # Simulate drift: the frozen override is cleared with no replacement
+    # (e.g. cli.py's override clear command, same gap as above).
+    saldo_final_cell = db.query(SheetCell).filter(
+        SheetCell.row_id == ids["saldo_final_id"], SheetCell.period_id == p0
+    ).first()
+    supersede_active_override(db, saldo_final_cell)
+    db.commit()
+
+    with pytest.raises(ValueError, match="has no active override"):
+        reopen_period(db, _sheet(db, ids["sheet_id"]), _period(db, p0))
+
+    assert _period(db, p0).is_closed is True

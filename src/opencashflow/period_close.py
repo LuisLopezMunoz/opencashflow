@@ -15,15 +15,18 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
-from opencashflow.engine import compute_sheet
+from opencashflow.engine import CellResult, compute_sheet
 from opencashflow.enums import AGGREGATE_ROW_TYPES
 from opencashflow.models import (
     CashflowSheet,
     CellActualEntry,
+    CellOverride,
+    SheetCell,
     SheetPeriod,
     SheetRow,
     SheetSection,
     get_or_create_cell,
+    supersede_active_override,
     supersede_and_write_override,
 )
 
@@ -65,7 +68,7 @@ def find_balance_row(db, sheet_id: int) -> SheetRow:
 
 
 def _real_value(row_id: int, period_id: int, row_by_id: Dict[int, SheetRow],
-                 cell_result_by_key: Dict[Tuple[int, int], object]) -> Decimal:
+                 cell_result_by_key: Dict[Tuple[int, int], CellResult]) -> Decimal:
     """Recompute a row's value for `period_id` from REAL (settled) numbers
     instead of projected ones, by walking the SAME sum_rows composition the
     engine itself evaluates -- recursing so each row's own sign is applied
@@ -236,7 +239,7 @@ def close_period(
     # --- Compute the whole sheet once; every lookup below reads from this
     # single result (never recomputed independently, per design). ---------
     result = compute_sheet(sheet.id, db)
-    cell_result_by_key: Dict[Tuple[int, int], object] = {}
+    cell_result_by_key: Dict[Tuple[int, int], CellResult] = {}
     row_by_id: Dict[int, SheetRow] = {}
     for section_data in result["sections"]:
         for row_data in section_data["rows"]:
@@ -400,6 +403,192 @@ def close_period(
         rollovers=rollovers,
         warnings=warnings,
         next_period_label=next_period_label,
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        db.rollback()
+    else:
+        db.commit()
+
+    return report
+
+
+@dataclasses.dataclass
+class ReopenReport:
+    sheet_id: int
+    period_id: int
+    period_label: str
+    balance_final_row_name: str
+    touched_notes: List[str] = dataclasses.field(default_factory=list)
+    dry_run: bool = False
+
+
+def reopen_period(
+    db,
+    sheet: CashflowSheet,
+    period: SheetPeriod,
+    *,
+    balance_row: Optional[SheetRow] = None,
+    dry_run: bool = False,
+) -> ReopenReport:
+    """Undo close_period's one effect that reverses cleanly on its own:
+    supersede the frozen "real ending balance" override on
+    balance_final_row's cell for this period (so it recomputes from its own
+    sum_rows rule again), and flip is_closed back to False.
+
+    Deliberately narrow -- this does NOT automatically undo any
+    assume_unrecorded_as_pending backfill (a CellActualEntry written onto an
+    individual row) or rollover (a CellOverride written onto the NEXT
+    period) the original close_period call may also have made. Reversing
+    those correctly would mean re-deriving exactly what that close touched
+    and unwinding it, including anything already built on top of it since
+    (a later close, further records) -- real cascading-undo complexity with
+    no bug behind it, deferred rather than risked. Instead,
+    ReopenReport.touched_notes lists close_period's own backfill entries (on
+    THIS period) and rollover overrides (on the NEXT period ONLY -- never on
+    this period, since a "period_close:"-prefixed override active on THIS
+    period's own cells could only be a rollover written by the PREVIOUS
+    period's own close, not by this one) still carrying one of its
+    "period_close: ..." note prefixes, so a caller can inspect and manually
+    address them (`record undo` / `override clear`) if a fully clean
+    re-close is wanted.
+
+    Raises ValueError if:
+      - `period` is not currently closed.
+      - Any LATER period on `sheet` is already closed -- mirrors
+        close_period's own "earlier periods must already be closed" guard,
+        in reverse: a later period's own close already depends on this
+        period's ending balance staying frozen as real.
+    """
+    if period.sheet_id != sheet.id:
+        raise ValueError(f"Period #{period.id} does not belong to sheet #{sheet.id}.")
+    if not period.is_closed:
+        raise ValueError(f"Period {_period_label(period)} is not closed -- nothing to reopen.")
+
+    # --- Guard: no LATER period is already closed. -------------------------
+    later_closed = (
+        db.query(SheetPeriod)
+        .filter(
+            SheetPeriod.sheet_id == sheet.id,
+            SheetPeriod.sort_order > period.sort_order,
+            SheetPeriod.is_closed.is_(True),
+        )
+        .order_by(SheetPeriod.sort_order)
+        .all()
+    )
+    if later_closed:
+        labels = ", ".join(_period_label(p) for p in later_closed)
+        raise ValueError(
+            f"Cannot reopen {_period_label(period)}: later period(s) are already closed "
+            f"({labels}) -- their own close already depends on this period's ending balance "
+            f"staying frozen as real. Reopen them first, in reverse chronological order."
+        )
+
+    if balance_row is None:
+        balance_row = find_balance_row(db, sheet.id)
+    balance_final_row = resolve_balance_final_row(db, balance_row)
+    period_label = _period_label(period)
+
+    # --- Guard: the cell's active override must actually be the one
+    # close_period wrote for THIS close -- never assume it, since the
+    # sheet's balance-row wiring (auto-detected via find_balance_row, or an
+    # explicit `balance_row` passed in) could differ from what was true at
+    # close time, or something else (e.g. a plain `override set`) could have
+    # since overwritten it. Silently superseding whatever happens to be
+    # active there would flip is_closed back to False while leaving the REAL
+    # frozen close_period override untouched elsewhere, and report success.
+    # Checked before any write, so "nothing written before every guard
+    # passes" stays true even for this DB-read-dependent check. -------------
+    expected_note_prefix = "period_close: real ending balance"
+    balance_final_cell = (
+        db.query(SheetCell)
+        .filter(SheetCell.row_id == balance_final_row.id, SheetCell.period_id == period.id)
+        .first()
+    )
+    active_override = None
+    if balance_final_cell is not None:
+        for ov in balance_final_cell.overrides:
+            if ov.superseded_at is None:
+                active_override = ov
+                break
+    if active_override is None:
+        raise ValueError(
+            f"Cannot reopen {period_label}: '{balance_final_row.name}' has no active override "
+            f"for this period even though it is marked closed -- close_period always writes "
+            f"one, so this looks like drift since the close. Investigate before reopening."
+        )
+    if not (active_override.note or "").startswith(expected_note_prefix):
+        raise ValueError(
+            f"Cannot reopen {period_label}: the active override on '{balance_final_row.name}' "
+            f"for this period does not look like the one close_period wrote (note: "
+            f"{active_override.note!r}) -- refusing to supersede a value that may not be "
+            f"close_period's own frozen ending balance. Investigate before reopening."
+        )
+
+    try:
+        supersede_active_override(db, balance_final_cell)
+        period.is_closed = False
+        db.flush()
+
+        # --- Surface (read-only) anything else the original close touched,
+        # so the caller can decide whether to clean it up by hand. A
+        # "period_close:"-prefixed override can only ever legitimately exist
+        # on the NEXT period (the rollover close_period writes above) -- the
+        # "real ending balance" override close_period writes onto
+        # `period.id` itself is exactly the one already superseded above, so
+        # it's excluded by superseded_at.is_(None) by the time this query
+        # runs regardless. Querying period.id here too used to surface a
+        # PREVIOUS period's own rollover (written onto period.id as ITS
+        # "next period") as if THIS reopen's close had made it --
+        # misattributing real carried-forward financial history as "this
+        # reopen's leftover mess" and inviting an operator to
+        # `override clear` it. ------------------------------------------
+        next_period = (
+            db.query(SheetPeriod)
+            .filter(SheetPeriod.sheet_id == sheet.id, SheetPeriod.period_date == _next_calendar_month(period.period_date))
+            .first()
+        )
+
+        touched_notes: List[str] = []
+        touched_overrides = []
+        if next_period is not None:
+            touched_overrides = (
+                db.query(CellOverride)
+                .join(SheetCell, CellOverride.cell_id == SheetCell.id)
+                .filter(
+                    SheetCell.period_id == next_period.id,
+                    CellOverride.superseded_at.is_(None),
+                    CellOverride.note.isnot(None),
+                    CellOverride.note.like("period_close:%"),
+                )
+                .all()
+            )
+        for ov in touched_overrides:
+            touched_notes.append(f"{ov.cell.row.name}: override still active -- \"{ov.note}\"")
+
+        touched_entries = (
+            db.query(CellActualEntry)
+            .join(SheetCell, CellActualEntry.cell_id == SheetCell.id)
+            .filter(
+                SheetCell.period_id == period.id,
+                CellActualEntry.note.isnot(None),
+                CellActualEntry.note.like("period_close:%"),
+            )
+            .all()
+        )
+        for entry in touched_entries:
+            touched_notes.append(f"{entry.cell.row.name}: real entry recorded by the original close -- \"{entry.note}\"")
+    except Exception:
+        db.rollback()
+        raise
+
+    report = ReopenReport(
+        sheet_id=sheet.id,
+        period_id=period.id,
+        period_label=period_label,
+        balance_final_row_name=balance_final_row.name,
+        touched_notes=touched_notes,
         dry_run=dry_run,
     )
 
