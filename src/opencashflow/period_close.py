@@ -372,7 +372,7 @@ def close_period(
             new_value = base_next_amt + pending
 
             next_cell = get_or_create_cell(db, row.id, next_period.id)
-            replaced = supersede_and_write_override(
+            _, replaced = supersede_and_write_override(
                 db, next_cell, new_value, created_by=acting_user_id,
                 note=(
                     f"period_close: original projection {base_next_amt} + unpaid rollover "

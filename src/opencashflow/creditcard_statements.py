@@ -671,7 +671,7 @@ def _write_projection_branch(
         f"el ciclo que cierra {billing_label}, pagadero en {period_label} (todavía no hay estado "
         f"de cuenta real registrado para ese ciclo)."
     )
-    previous = supersede_and_write_override(db, cell, new_value, created_by=acting_user_id, note=note)
+    _, previous = supersede_and_write_override(db, cell, new_value, created_by=acting_user_id, note=note)
     old_value = previous.value if previous is not None else None
     return old_value, new_value, note
 

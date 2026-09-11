@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
     JSON,
@@ -422,15 +422,19 @@ def supersede_and_write_override(
     override_type: str = "manual_value",
     custom_rule: Optional[Dict[str, Any]] = None,
     note: Optional[str] = None,
-) -> Optional["CellOverride"]:
+) -> Tuple["CellOverride", Optional["CellOverride"]]:
     """Supersede `cell`'s active override (superseded_at is None), if any,
-    then insert the new one. Returns the superseded override (or None) so a
-    caller can tell "replaced an existing override" apart from "this cell
-    had none yet" -- e.g. for a status message."""
+    then insert the new one. Returns (new_override, previous_override) --
+    previous is None when the cell had none yet, letting a caller tell
+    "replaced an existing override" apart from that case, e.g. for a status
+    message. previous_override is the object itself (not just its value) so
+    a caller can describe it correctly even for a manual_rule override,
+    whose value column is always None."""
     previous = supersede_active_override(db, cell)
-    db.add(CellOverride(
+    new_override = CellOverride(
         cell_id=cell.id, value=value, override_type=override_type,
         custom_rule=custom_rule, note=note, created_by=created_by,
-    ))
+    )
+    db.add(new_override)
     db.flush()
-    return previous
+    return new_override, previous

@@ -68,6 +68,9 @@ from opencashflow.models import (
     SheetRow,
     SheetSection,
 )
+from opencashflow.overrides import OverrideClearResult, OverrideWriteResult
+from opencashflow.overrides import clear_override as _do_clear_override
+from opencashflow.overrides import set_override as _do_set_override
 from opencashflow.period_close import AGGREGATE_ROW_TYPES as _AGGREGATE_ROW_TYPES
 from opencashflow.period_close import CloseReport, ReopenReport, close_period, reopen_period
 from opencashflow.period_close import find_balance_row as _find_balance_row_or_raise
@@ -871,32 +874,11 @@ def _diagnose(result) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Cell override write primitives (shared by `override set` / `override
-# clear`, and reusable as-is by the later wizard phase)
+# Cell override write primitives now live in opencashflow.overrides (shared
+# by `override set` / `override clear`, the wizard, AND any other consumer
+# of this package -- see that module's own docstring for why this used to
+# live here, underscore-prefixed, and no longer does).
 # ---------------------------------------------------------------------------
-
-@dataclasses.dataclass
-
-
-class OverrideWriteResult:
-    period: SheetPeriod
-    override: Optional[CellOverride]  # None only when a --lock write was skipped
-    previous_override: Optional[CellOverride] = None
-    skipped: bool = False
-    skip_reason: Optional[str] = None
-
-
-@dataclasses.dataclass
-
-
-class OverrideClearResult:
-    period: SheetPeriod
-    previous_override: Optional[CellOverride]  # None means there was nothing active to clear
-    reverted_value: Optional[Decimal] = None
-    reverted_source: Optional[str] = None
-
-
-
 
 def _print_override_write_results(
     row: SheetRow, results: List["OverrideWriteResult"], row_id_to_name: Dict[int, str], indent: str = "",
@@ -1006,152 +988,6 @@ def _resolve_target_periods(
 
 
 
-def _supersede_and_write_override(
-    db, cell: SheetCell, override_type: str, value: Optional[Decimal], custom_rule: Optional[dict],
-    note: Optional[str], created_by: int,
-) -> Tuple[CellOverride, Optional[CellOverride]]:
-    """Supersede the cell's active override (if any) and insert a new one.
-    Returns (new_override, previous_override) -- previous_override is
-    returned (not just its value) so the caller can describe it correctly
-    even for a manual_rule override, whose value column is always None."""
-    previous = None
-    for ov in cell.overrides:
-        if ov.superseded_at is None:
-            previous = ov
-            break
-    if previous is not None:
-        previous.superseded_at = datetime.utcnow()
-        db.flush()
-
-    override = CellOverride(
-        cell_id=cell.id, value=value, override_type=override_type,
-        custom_rule=custom_rule, note=note, created_by=created_by,
-    )
-    db.add(override)
-    db.flush()
-    return override, previous
-
-
-
-
-def _get_or_create_cell(db, row_id: int, period_id: int) -> SheetCell:
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row_id, SheetCell.period_id == period_id).first()
-    if not cell:
-        cell = SheetCell(row_id=row_id, period_id=period_id)
-        db.add(cell)
-        db.flush()
-    return cell
-
-
-
-
-def _do_set_override(
-    db, sheet_id: int, row: SheetRow, periods: List[SheetPeriod], *,
-    value: Optional[Decimal] = None, rule: Optional[dict] = None, lock: bool = False,
-    note: Optional[str] = None, created_by: int,
-) -> List[OverrideWriteResult]:
-    """Write the SAME override onto every period in `periods` for `row`.
-    Exactly one of value/rule/lock is expected to be meaningful -- validated
-    by the caller (cmd_override_set), since a later wizard caller already
-    knows which one it wants and shouldn't have to fake the other two.
-
-    --lock: computes the sheet ONCE up front (nothing this function does
-    changes projected values before the lock writes, so one shared snapshot
-    for the whole call is correct) and captures each targeted cell's current
-    effective projected_value as the override's value -- NEVER None. A
-    period whose captured value is None (nothing to lock yet) is skipped
-    (skip_reason set, no override written for it), not silently written with
-    value=None.
-
-    Commits once at the end. Every write supersedes any existing active
-    override on that cell first (see _supersede_and_write_override).
-    """
-    _guard_periods_not_closed(periods, "escribir un override")
-
-    captured_by_period: Dict[int, Optional[Decimal]] = {}
-    if lock:
-        result = compute_sheet(sheet_id, db)
-        for section_data in result["sections"]:
-            for row_data in section_data["rows"]:
-                if row_data["row"].id != row.id:
-                    continue
-                for cr in row_data["cells"]:
-                    captured_by_period[cr.period_id] = cr.projected_value
-
-    if lock:
-        override_type = "lock"
-    elif rule is not None:
-        override_type = "manual_rule"
-    else:
-        override_type = "manual_value"
-
-    results: List[OverrideWriteResult] = []
-    for period in periods:
-        if lock:
-            captured_value = captured_by_period.get(period.id)
-            if captured_value is None:
-                results.append(OverrideWriteResult(
-                    period=period, override=None, skipped=True,
-                    skip_reason="la celda no tiene ningún valor efectivo todavía -- no hay nada que bloquear",
-                ))
-                continue
-            ov_value, ov_rule = captured_value, None
-        elif rule is not None:
-            ov_value, ov_rule = None, rule
-        else:
-            ov_value, ov_rule = value, None
-
-        cell = _get_or_create_cell(db, row.id, period.id)
-        override, previous = _supersede_and_write_override(
-            db, cell, override_type, ov_value, ov_rule, note, created_by,
-        )
-        results.append(OverrideWriteResult(period=period, override=override, previous_override=previous))
-
-    db.commit()
-    return results
-
-
-
-
-def _do_clear_override(db, sheet_id: int, row: SheetRow, periods: List[SheetPeriod]) -> List[OverrideClearResult]:
-    """Supersede the active override (if any) on every (row, period) cell in
-    `periods`. A period with no active override is a no-op for it (reported,
-    not an error). After clearing, recomputes the sheet ONCE and reports
-    what each cell's value reverted to -- its own rule's result, or None
-    ("sin valor") if it has none -- which is the whole point of the command.
-    """
-    _guard_periods_not_closed(periods, "limpiar un override")
-
-    results: List[OverrideClearResult] = []
-    for period in periods:
-        cell = db.query(SheetCell).filter(SheetCell.row_id == row.id, SheetCell.period_id == period.id).first()
-        previous = None
-        if cell is not None:
-            for ov in cell.overrides:
-                if ov.superseded_at is None:
-                    previous = ov
-                    break
-            if previous is not None:
-                previous.superseded_at = datetime.utcnow()
-                db.flush()
-        results.append(OverrideClearResult(period=period, previous_override=previous))
-    db.commit()
-
-    result = compute_sheet(sheet_id, db)
-    cell_result_by_period: Dict[int, object] = {}
-    for section_data in result["sections"]:
-        for row_data in section_data["rows"]:
-            if row_data["row"].id != row.id:
-                continue
-            for cr in row_data["cells"]:
-                cell_result_by_period[cr.period_id] = cr
-
-    for r in results:
-        cr = cell_result_by_period.get(r.period.id)
-        r.reverted_value = cr.projected_value if cr else None
-        r.reverted_source = cr.effective_source if cr else None
-
-    return results
 
 
 # ---------------------------------------------------------------------------
