@@ -22,7 +22,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from opencashflow.engine import compute_sheet
+from opencashflow.engine import compute_sheet, evaluate_sheet
 from opencashflow.models import Base, CashflowSheet, CellOverride, SheetCell, SheetPeriod, SheetRow, SheetSection
 
 TEST_DB_URL = "sqlite:///:memory:"
@@ -834,3 +834,102 @@ def test_value_override_takes_priority_over_a_real_manual_override(db):
 
     matrix = compute_sheet(sheet.id, db, value_overrides={(row.id, period.id): Decimal("999")})
     assert _cells_for(matrix, row.id)[0].projected_value == Decimal("999")
+
+
+# ---------------------------------------------------------------------------
+# 8. evaluate_sheet -- the pure computation compute_sheet delegates to after
+#    doing its own DB loading. This is the actual point of the split
+#    documented in compute_sheet's own former "KNOWN FUTURE REFACTOR" note
+#    (now PENDIENTES.md, resolved): every argument below is an unpersisted
+#    ORM object built directly in Python -- no db session, no SQLite file,
+#    no query anywhere in this test. evaluate_sheet itself never touches a
+#    session (overrides come from a plain dict, never a lazy-loaded
+#    cell.overrides), so this is exactly the "pure Python fixture" test the
+#    old docstring said wasn't possible yet.
+# ---------------------------------------------------------------------------
+
+def test_evaluate_sheet_computes_with_zero_database_access():
+    section = SheetSection(id=1, sheet_id=1, name="Resumen", section_type="custom")
+    sueldo = SheetRow(id=1, section_id=1, name="Sueldo", sign="positive",
+                       default_projection_rule={"type": "constant", "value": 100})
+    total = SheetRow(id=2, section_id=1, name="Total", sign="positive",
+                      default_projection_rule={"type": "sum_rows", "row_ids": [1]})
+    period = SheetPeriod(id=1, sheet_id=1, period_date=datetime(2026, 1, 1), label="Jan 2026", sort_order=0)
+
+    result_sections = evaluate_sheet(
+        periods=[period],
+        sections=[section],
+        rows_by_section={1: [sueldo, total]},
+        all_rows=[sueldo, total],
+        cell_map={},
+        overrides_by_cell_id={},
+    )
+
+    cells_by_row_id = {
+        row_data["row"].id: row_data["cells"]
+        for section_data in result_sections
+        for row_data in section_data["rows"]
+    }
+    assert cells_by_row_id[sueldo.id][0].projected_value == Decimal("100")
+    assert cells_by_row_id[total.id][0].projected_value == Decimal("100")
+
+
+def test_evaluate_sheet_resolves_overrides_from_a_plain_dict_not_a_relationship():
+    """Confirms overrides_by_cell_id (not cell.overrides) is what actually
+    drives override resolution -- the cell object passed in has no
+    `overrides` relationship configured at all (it isn't attached to any
+    session), so if evaluate_sheet tried to read cell.overrides directly
+    instead of the dict, this would raise, not silently fall through."""
+    section = SheetSection(id=1, sheet_id=1, name="Resumen", section_type="custom")
+    row = SheetRow(id=1, section_id=1, name="Sueldo", sign="positive",
+                    default_projection_rule={"type": "constant", "value": 100})
+    period = SheetPeriod(id=1, sheet_id=1, period_date=datetime(2026, 1, 1), label="Jan 2026", sort_order=0)
+    cell = SheetCell(id=1, row_id=1, period_id=1)
+    override = CellOverride(id=1, cell_id=1, value=Decimal("999"), override_type="manual_value",
+                             created_by=1, superseded_at=None)
+
+    result_sections = evaluate_sheet(
+        periods=[period],
+        sections=[section],
+        rows_by_section={1: [row]},
+        all_rows=[row],
+        cell_map={(1, 1): cell},
+        overrides_by_cell_id={1: [override]},
+    )
+
+    cells = result_sections[0]["rows"][0]["cells"]
+    assert cells[0].projected_value == Decimal("999")
+
+
+def test_evaluate_sheet_sorts_periods_defensively_even_if_passed_out_of_order():
+    """previous_period/rolling_average/carry_forward all resolve by LIST
+    POSITION, not by sort_order value -- compute_sheet (the only real caller)
+    always sorts before calling in, but evaluate_sheet is a documented
+    public, DB-free entry point other callers can use directly with
+    hand-built fixtures, so it must not silently trust caller ordering."""
+    section = SheetSection(id=1, sheet_id=1, name="Resumen", section_type="custom")
+    total = SheetRow(id=1, section_id=1, name="Total", sign="positive")
+    saldo = SheetRow(id=2, section_id=1, name="Saldo", sign="positive",
+                      default_projection_rule={"type": "previous_period", "row_id": 1})
+    period_jan = SheetPeriod(id=1, sheet_id=1, period_date=datetime(2026, 1, 1), label="Jan 2026", sort_order=0)
+    period_feb = SheetPeriod(id=2, sheet_id=1, period_date=datetime(2026, 2, 1), label="Feb 2026", sort_order=1)
+
+    result_sections = evaluate_sheet(
+        periods=[period_feb, period_jan],  # deliberately reversed
+        sections=[section],
+        rows_by_section={1: [total, saldo]},
+        all_rows=[total, saldo],
+        cell_map={},
+        overrides_by_cell_id={},
+        value_overrides={(1, period_jan.id): Decimal("100"), (1, period_feb.id): Decimal("200")},
+    )
+
+    cells_by_row_id = {
+        row_data["row"].id: {cr.period_id: cr for cr in row_data["cells"]}
+        for section_data in result_sections
+        for row_data in section_data["rows"]
+    }
+    # Saldo/Feb must read Total's JAN value (100), the chronological
+    # predecessor -- not simply "whatever came first in the input list".
+    assert cells_by_row_id[saldo.id][period_feb.id].projected_value == Decimal("100")
+    assert cells_by_row_id[saldo.id][period_jan.id].projected_value is None

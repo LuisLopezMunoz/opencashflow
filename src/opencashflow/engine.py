@@ -102,12 +102,12 @@ Cycle detection:
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
 
 from sqlalchemy.orm import Session
 
 from opencashflow.enums import ROW_SIGNS
-from opencashflow.models import CashflowSheet, SheetCell, SheetPeriod, SheetRow, SheetSection
+from opencashflow.models import CashflowSheet, CellOverride, SheetCell, SheetPeriod, SheetRow, SheetSection
 
 
 class EffectiveSource(str, Enum):
@@ -230,7 +230,15 @@ def _detect_cycles(
     return in_cycle
 
 
-def _real_fields(cell: Optional[SheetCell], projected_value: Optional[Decimal]) -> Dict[str, Optional[Decimal]]:
+class _RealFields(TypedDict):
+    actual_value: Optional[Decimal]
+    accrued_value: Optional[Decimal]
+    paid_value: Optional[Decimal]
+    pending_value: Optional[Decimal]
+    variance: Optional[Decimal]
+
+
+def _real_fields(cell: Optional[SheetCell], projected_value: Optional[Decimal]) -> _RealFields:
     """Pass through the 'real' fields already stored on a cell and derive the
     two computed ones (pending_value, variance) from them.
 
@@ -239,6 +247,12 @@ def _real_fields(cell: Optional[SheetCell], projected_value: Optional[Decimal]) 
     is a normal, common state -- not an error. Whatever writes actual_value
     (a manual entry, or a future ledger bridge) is outside the engine; this
     only reads what's already on the row.
+
+    Returns a TypedDict (not a plain Dict[str, Optional[Decimal]]) purely so
+    every **_real_fields(...) call site below type-checks precisely against
+    CellResult's mixed-type fields -- mypy can't validate **dict unpacking
+    key-by-key against a dataclass constructor for a plain homogeneous Dict,
+    only for a TypedDict.
     """
     if cell is None:
         return {"actual_value": None, "accrued_value": None, "paid_value": None,
@@ -370,20 +384,13 @@ def _evaluate_rule(
 
 
 def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[Tuple[int, int], Optional[Decimal]]] = None) -> Dict:
-    """Compute all cell values for a sheet and return the result dict.
+    """Load a sheet's full state from the database and compute all its cell
+    values. Thin I/O wrapper around evaluate_sheet (below), which is where
+    every bit of actual computation lives -- see that function's own
+    docstring for the split's rationale.
 
     value_overrides supplies ephemeral scenario values keyed by (row_id, period_id).
     They propagate through dependent rules without writing cells or audit entries.
-
-    KNOWN FUTURE REFACTOR (not done here): this function mixes DB I/O (the
-    queries at the top) with pure computation (the topo-sort/evaluation
-    loop below), which is why every test of the pure evaluation logic in
-    test_engine_rules.py has to go through a full SQLite round-trip instead
-    of plain Python fixtures. Splitting it into a data-loading stage and a
-    pure evaluate(rows, periods, rules, cells) function would fix that, but
-    it's a real restructuring of the engine's central function with no bug
-    behind it -- left as a dedicated future refactor once the correctness
-    fixes made alongside this docstring update have had time to prove out.
 
     Returns a dict with structure:
     {
@@ -406,16 +413,13 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
     if sheet is None:
         raise ValueError(f"Sheet {sheet_id} not found")
 
-    # Load all periods sorted
     periods: List[SheetPeriod] = (
         db.query(SheetPeriod)
         .filter(SheetPeriod.sheet_id == sheet_id)
         .order_by(SheetPeriod.sort_order)
         .all()
     )
-    sorted_period_ids = [p.id for p in periods]
 
-    # Load sections with rows (ordered)
     sections: List[SheetSection] = (
         db.query(SheetSection)
         .filter(SheetSection.sheet_id == sheet_id)
@@ -423,7 +427,6 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
         .all()
     )
 
-    # Collect all row ids across all sections
     rows_by_section: Dict[int, List[SheetRow]] = {}
     all_rows: List[SheetRow] = []
     for section in sections:
@@ -436,6 +439,85 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
         rows_by_section[section.id] = rows
         all_rows.extend(rows)
 
+    all_row_ids = [r.id for r in all_rows]
+    all_cells: List[SheetCell] = (
+        db.query(SheetCell)
+        .filter(SheetCell.row_id.in_(all_row_ids))
+        .all()
+    )
+    cell_map: Dict[Tuple[int, int], SheetCell] = {
+        (c.row_id, c.period_id): c for c in all_cells
+    }
+
+    # Every override for every one of this sheet's cells, fetched in ONE
+    # query and grouped by cell_id below -- instead of accessing each
+    # cell.overrides individually (a SQLAlchemy relationship, which would
+    # lazily re-query the session once per cell). This is what lets
+    # evaluate_sheet below do the actual override-resolution logic with NO
+    # db/session access of its own: everything it needs is already a plain
+    # Python dict by the time it's called.
+    cell_ids = [c.id for c in all_cells]
+    all_overrides: List[CellOverride] = (
+        db.query(CellOverride)
+        .filter(CellOverride.cell_id.in_(cell_ids))
+        .order_by(CellOverride.created_at, CellOverride.id)
+        .all()
+    ) if cell_ids else []
+    overrides_by_cell_id: Dict[int, List[CellOverride]] = {}
+    for ov in all_overrides:
+        overrides_by_cell_id.setdefault(ov.cell_id, []).append(ov)
+
+    result_sections = evaluate_sheet(
+        periods=periods,
+        sections=sections,
+        rows_by_section=rows_by_section,
+        all_rows=all_rows,
+        cell_map=cell_map,
+        overrides_by_cell_id=overrides_by_cell_id,
+        value_overrides=value_overrides,
+    )
+
+    return {
+        "sheet": sheet,
+        "periods": periods,
+        "sections": result_sections,
+    }
+
+
+def evaluate_sheet(
+    *,
+    periods: List[SheetPeriod],
+    sections: List[SheetSection],
+    rows_by_section: Dict[int, List[SheetRow]],
+    all_rows: List[SheetRow],
+    cell_map: Dict[Tuple[int, int], SheetCell],
+    overrides_by_cell_id: Dict[int, List[CellOverride]],
+    value_overrides: Optional[Dict[Tuple[int, int], Optional[Decimal]]] = None,
+) -> List[Dict]:
+    """The actual computation: override resolution, dependency-graph
+    construction, cycle detection, topological sort, and rule evaluation --
+    everything compute_sheet used to do inline mixed with its own DB
+    queries. NO db/session access happens anywhere in this function: every
+    argument is a plain Python list/dict, and every ORM object passed in
+    (SheetRow/SheetPeriod/SheetSection/SheetCell/CellOverride) is read only
+    for its own plain columns, never a lazy-loaded relationship -- so a
+    caller can construct all of these directly (unpersisted instances are
+    fine, e.g. `SheetRow(id=1, name="A", sign="positive")`) and call this
+    with no SQLite/session round-trip at all. This is what compute_sheet's
+    own KNOWN FUTURE REFACTOR note used to ask for: every rule-evaluation
+    test that only cares about the math, not the persistence, can exercise
+    this function directly with plain fixtures instead.
+
+    Returns result_sections in the exact shape compute_sheet nests under
+    its own "sections" key.
+    """
+    # Every previous_period/rolling_average/carry_forward computation below
+    # depends on `periods`' list POSITION here, not on sort_order values
+    # themselves -- defensively re-sort so any caller besides compute_sheet
+    # (which already sorts) can't silently get a wrong "previous period"
+    # with no error. A local rebinding, not a mutation of the caller's list.
+    periods = sorted(periods, key=lambda p: p.sort_order)
+    sorted_period_ids = [p.id for p in periods]
     row_map: Dict[int, SheetRow] = {r.id: r for r in all_rows}
     all_row_ids = list(row_map.keys())
     # row_id → +1 ("positive", the default) / -1 ("negative"). Used by sum_rows
@@ -443,17 +525,6 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
     # a positive magnitude.
     row_signs: Dict[int, int] = {
         r.id: (-1 if r.sign == "negative" else 1) for r in all_rows
-    }
-
-    # Load all existing cells for this sheet (to fetch persisted overrides)
-    all_cells: List[SheetCell] = (
-        db.query(SheetCell)
-        .filter(SheetCell.row_id.in_(all_row_ids))
-        .all()
-    )
-    # Index: (row_id, period_id) → SheetCell
-    cell_map: Dict[Tuple[int, int], SheetCell] = {
-        (c.row_id, c.period_id): c for c in all_cells
     }
 
     # Precompute each cell's own pending_value (accrued_value - paid_value,
@@ -470,7 +541,13 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
 
     # For each row determine its effective rule per period
     # effective_rules[(row_id, period_id)] = (rule_dict or None, is_manual_value, manual_value)
-    effective_manual: Dict[Tuple[int, int], Decimal] = {}  # manual_value overrides
+    # Optional[Decimal], not plain Decimal: a manual_value/lock override's own
+    # CellOverride.value column is nullable (a lock capturing "no value yet"
+    # is a real, reachable state), and value_overrides' own values are
+    # Optional[Decimal] too -- _quantize (the only reader) already accepts
+    # and passes through None, so this was already reachable at runtime,
+    # just invisible to a type checker before models.py's Mapped[] migration.
+    effective_manual: Dict[Tuple[int, int], Optional[Decimal]] = {}  # manual_value overrides
     effective_rules: Dict[Tuple[int, int], Optional[Dict]] = {}  # rule for each cell
 
     for row in all_rows:
@@ -480,9 +557,9 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
                 effective_manual[key] = value_overrides[key]
                 effective_rules[key] = None
                 continue
-            cell = cell_map.get(key)
-            if cell is not None:
-                active_ov = _get_active_override(cell.overrides)
+            override_cell = cell_map.get(key)
+            if override_cell is not None:
+                active_ov = _get_active_override(overrides_by_cell_id.get(override_cell.id, []))
                 if active_ov is not None:
                     if active_ov.override_type == "manual_value":
                         effective_manual[key] = active_ov.value
@@ -654,7 +731,7 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
     result_sections = []
     for section in sections:
         row_outputs = []
-        for row in rows_by_section[section.id]:
+        for row in rows_by_section.get(section.id, []):
             cells = [
                 results_by_row_period.get(
                     (row.id, period.id),
@@ -670,11 +747,7 @@ def compute_sheet(sheet_id: int, db: Session, *, value_overrides: Optional[Dict[
             row_outputs.append({"row": row, "cells": cells})
         result_sections.append({"section": section, "rows": row_outputs})
 
-    return {
-        "sheet": sheet,
-        "periods": periods,
-        "sections": result_sections,
-    }
+    return result_sections
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +802,7 @@ def build_sum_rows_hierarchy(db: Session, sheet_id: int) -> Tuple[Dict[int, Shee
         for child_id in rule.get("row_ids", []):
             existing_parent = child_to_parent.get(child_id)
             if existing_parent is not None and existing_parent != r.id:
-                other_name = rows_by_id.get(existing_parent).name if existing_parent in rows_by_id else existing_parent
+                other_name = rows_by_id[existing_parent].name if existing_parent in rows_by_id else existing_parent
                 raise ValueError(
                     f"Row #{child_id} appears in the sum_rows of more than one row "
                     f"('{other_name}' and '{r.name}') -- its effect on the bottom line "

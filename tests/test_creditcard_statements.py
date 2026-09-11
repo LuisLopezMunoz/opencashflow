@@ -141,7 +141,7 @@ def _active_override(db, cell_id: int):
 
 def _add_statement(db, card, billing_period: date, *, new_balance, total_payment_due, previous_balance=None,
                     remaining_principal_installments=None, created_by=TEST_USER_ID,
-                    closing_date=None, due_date=None) -> CreditCardStatement:
+                    closing_date=None, due_date=None, interest_charged=None, minimum_payment=None) -> CreditCardStatement:
     stmt = CreditCardStatement(
         credit_card_id=card.id, billing_period=billing_period,
         previous_balance=Decimal(str(previous_balance)) if previous_balance is not None else None,
@@ -149,6 +149,8 @@ def _add_statement(db, card, billing_period: date, *, new_balance, total_payment
         remaining_principal_installments=(
             Decimal(str(remaining_principal_installments)) if remaining_principal_installments is not None else None
         ),
+        interest_charged=Decimal(str(interest_charged)) if interest_charged is not None else None,
+        minimum_payment=Decimal(str(minimum_payment)) if minimum_payment is not None else None,
         closing_date=closing_date or billing_period, due_date=due_date or billing_period,
         currency="CLP", source="manual", created_by=created_by,
     )
@@ -225,6 +227,64 @@ def test_compute_instant_statement_wraps_real_statement_without_projection(db, c
     assert len(result.lines) == 1
     assert result.lines[0].description == "Restaurante"
     assert result.lines[0].is_projected is False
+
+
+# ---------------------------------------------------------------------------
+# 2b. interest / minimum_payment projection -- CreditCard.interest_rate/
+#     minimum_payment_rate used to be stored but unread by any computation.
+# ---------------------------------------------------------------------------
+
+def test_projected_interest_and_minimum_payment_with_known_previous_balance(db, card):
+    # card.interest_rate=0.2 (20% annual), minimum_payment_rate=0.05 (5%).
+    _add_statement(db, card, date(2026, 1, 1), new_balance=1_000_000, total_payment_due=50_000)
+    _add_charge(db, card, amount=200_000, installments=1, first_statement_period=date(2026, 2, 1))
+
+    result = compute_instant_statement(db, card, date(2026, 2, 1))
+    assert result.is_real is False
+    assert result.previous_balance == Decimal("1000000")
+    assert result.charges_due_this_cycle == Decimal("200000")
+    # interest = 1,000,000 * (0.2 / 12) = 16,666.666... -> 16,666.67
+    assert result.interest == Decimal("16666.67")
+    # minimum_payment = 0.05 * (1,000,000 + 200,000) = 60,000.00
+    assert result.minimum_payment == Decimal("60000.00")
+
+
+def test_projected_interest_and_minimum_payment_are_none_when_previous_balance_unknown(db, card):
+    result = compute_instant_statement(db, card, date(2026, 3, 1))
+    assert result.previous_balance_known is False
+    assert result.interest is None
+    assert result.minimum_payment is None
+
+
+def test_projected_interest_is_zero_not_negative_when_previous_balance_is_zero_or_less(db, card):
+    _add_statement(db, card, date(2026, 1, 1), new_balance=0, total_payment_due=0)
+    result = compute_instant_statement(db, card, date(2026, 2, 1))
+    assert result.previous_balance == Decimal("0")
+    assert result.interest == Decimal("0")
+    # minimum_payment still applies to whatever's newly due this cycle, even
+    # with a zero starting balance.
+    assert result.minimum_payment == Decimal("0.00")
+
+
+def test_real_statement_surfaces_its_own_interest_and_minimum_payment(db, card):
+    _add_statement(
+        db, card, date(2026, 3, 1), new_balance=400_000, total_payment_due=120_000, previous_balance=280_000,
+        interest_charged=5_432, minimum_payment=25_000,
+    )
+    result = compute_instant_statement(db, card, date(2026, 3, 1))
+    assert result.is_real is True
+    # Read straight off the real statement -- NOT recomputed via the
+    # projection formula (which would give a different number here).
+    assert result.interest == Decimal("5432")
+    assert result.minimum_payment == Decimal("25000")
+
+
+def test_real_statement_interest_and_minimum_payment_are_none_when_bank_did_not_report_them(db, card):
+    _add_statement(db, card, date(2026, 3, 1), new_balance=400_000, total_payment_due=120_000, previous_balance=280_000)
+    result = compute_instant_statement(db, card, date(2026, 3, 1))
+    assert result.is_real is True
+    assert result.interest is None
+    assert result.minimum_payment is None
 
 
 # ---------------------------------------------------------------------------

@@ -13,9 +13,11 @@ CashflowSheet.user_id (see models.py): this package takes no dependency on
 a host app's own user table or its SQLAlchemy registry.
 """
 from datetime import datetime
+from decimal import Decimal
+from typing import List, Optional
 
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, Numeric, String
-from sqlalchemy.orm import relationship
+from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from opencashflow.models import Base
 
@@ -23,22 +25,22 @@ from opencashflow.models import Base
 class Wallet(Base):
     __tablename__ = "wallets"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
     # Plain int, not a ForeignKey -- see module docstring.
-    user_id = Column(Integer, nullable=False, index=True)
-    name = Column(String(100), nullable=False)
-    wallet_type = Column(String(50), nullable=False, default="cash")
-    currency = Column(String(10), nullable=False, default="USD")
-    balance = Column(Numeric(14, 2), nullable=False, default=0)
-    description = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    user_id: Mapped[int] = mapped_column(nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    wallet_type: Mapped[str] = mapped_column(String(50), nullable=False, default="cash")
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
+    balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
     # No delete-orphan -- this module's own docstring calls WalletMovement
     # "an append-only audit log" whose entries are never deleted or edited,
     # only ever appended to (a reversal is a new row, never a mutation of an
     # old one). Deleting a Wallet must not silently destroy that log.
-    movements = relationship(
-        "WalletMovement", back_populates="wallet", cascade="save-update, merge", passive_deletes=True,
+    movements: Mapped[List["WalletMovement"]] = relationship(
+        back_populates="wallet", cascade="save-update, merge", passive_deletes=True,
         foreign_keys="WalletMovement.wallet_id",
     )
 
@@ -85,14 +87,14 @@ class WalletMovement(Base):
         Index("ix_wallet_movements_row_period", "row_id", "period_id"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False, index=True)
-    amount = Column(Numeric(14, 2), nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), nullable=False, index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
 
-    sheet_id = Column(Integer, nullable=False)
-    row_id = Column(Integer, nullable=False)
-    period_id = Column(Integer, nullable=False)
-    actual_entry_id = Column(Integer, nullable=False)
+    sheet_id: Mapped[int] = mapped_column(nullable=False)
+    row_id: Mapped[int] = mapped_column(nullable=False)
+    period_id: Mapped[int] = mapped_column(nullable=False)
+    actual_entry_id: Mapped[int] = mapped_column(nullable=False)
 
     # unique=True (nullable-unique -- most rows have NULL here, and a NULL
     # never collides with another NULL under standard SQL unique-index
@@ -104,12 +106,12 @@ class WalletMovement(Base):
     # second INSERT hits this constraint and raises IntegrityError, which
     # wallet_movements.do_wallet_movement_undo translates into the same
     # "already reversed" ValueError the first-checker path already raises.
-    reverses_movement_id = Column(
-        Integer, ForeignKey("wallet_movements.id"), nullable=True, unique=True,
+    reverses_movement_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("wallet_movements.id"), nullable=True, unique=True,
     )
 
-    note = Column(String(255), nullable=True)
-    created_by = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    note: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_by: Mapped[Optional[int]] = mapped_column(nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
-    wallet = relationship("Wallet", back_populates="movements", foreign_keys=[wallet_id])
+    wallet: Mapped["Wallet"] = relationship(back_populates="movements", foreign_keys=[wallet_id])

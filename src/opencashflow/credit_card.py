@@ -16,19 +16,18 @@ dependency on a host app's own user table or its SQLAlchemy registry.
 """
 from datetime import date, datetime
 from decimal import Decimal
+from typing import List, Optional
 
 from sqlalchemy import (
-    Column,
     Date,
     DateTime,
     ForeignKey,
-    Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship, validates
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from opencashflow.enums import CREDIT_CARD_STATUSES, STATEMENT_LINE_TYPES, STATEMENT_SOURCES
 from opencashflow.models import Base
@@ -37,18 +36,18 @@ from opencashflow.models import Base
 class CreditCard(Base):
     __tablename__ = "credit_cards"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
     # Plain int, not a ForeignKey -- see module docstring.
-    user_id = Column(Integer, nullable=False, index=True)
-    name = Column(String(100), nullable=False)
-    bank = Column(String(100), nullable=True)
+    user_id: Mapped[int] = mapped_column(nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    bank: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # Numeric(14, 2), matching every other money column in this package --
     # these four used to be Float ("to avoid an unrelated migration", per a
     # comment on CreditCardCharge.amount predating this change). See
     # MIGRATIONS.md: on SQLite this needs no ALTER TABLE at all -- SQLite's
     # loose column typing means existing values already read back correctly
     # as Decimal through the new Numeric declaration.
-    credit_limit = Column(Numeric(14, 2), nullable=False)
+    credit_limit: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     # DEPRECATED: the old bookkeeping counter the statement-tracking feature
     # (creditcard_statements.py) supersedes. Never read by any computation in
     # this package -- cupo_disponible()/compute_instant_statement() derive
@@ -56,29 +55,34 @@ class CreditCard(Base):
     # only to its 0.0 default by every caller; kept for backward
     # compatibility with any consumer still reading it directly, not because
     # anything here still relies on it.
-    current_balance = Column(Numeric(14, 2), nullable=False, default=0)
-    currency = Column(String(10), nullable=False, default="USD")
-    closing_day = Column(Integer, nullable=True)  # day of month when statement closes
-    due_day = Column(Integer, nullable=True)      # day of month payment is due
-    # RESERVED/INERT: stored and settable via the CLI's create/update
-    # commands, but grep-confirmed unread by any computation in this
-    # package -- no interest-accrual or minimum-payment-due projection is
-    # implemented yet. Annual interest rate (e.g. 0.24 for 24 %) agreed with
-    # the bank (tasa pactada), for whenever that projection is built.
-    interest_rate = Column(Numeric(14, 2), nullable=False, default=0)
-    # RESERVED/INERT, same situation as interest_rate above: minimum payment
-    # as a fraction of the current balance (e.g. 0.05 for 5 %), unused by any
-    # computation today.
-    minimum_payment_rate = Column(Numeric(14, 2), nullable=False, default=Decimal("0.05"))
+    current_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
+    closing_day: Mapped[Optional[int]] = mapped_column(nullable=True)  # day of month when statement closes
+    due_day: Mapped[Optional[int]] = mapped_column(nullable=True)      # day of month payment is due
+    # Annual interest rate (e.g. 0.24 for 24 %) agreed with the bank (tasa
+    # pactada). Used by creditcard_statements._project_interest_and_minimum_payment
+    # to project a NOT-YET-REAL cycle's interest charge as simple
+    # (non-compounding) interest at 1/12 of this rate on the previous
+    # cycle's balance -- an explicitly documented, unconfirmed assumption
+    # (see that function's own warning); a real CreditCardStatement's own
+    # interest_charged, once one exists, is always used instead.
+    interest_rate: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    # Minimum payment as a fraction of the balance owed (e.g. 0.05 for 5 %).
+    # Same situation as interest_rate above: used to project a NOT-YET-REAL
+    # cycle's minimum payment due, superseded by a real statement's own
+    # minimum_payment once one exists.
+    minimum_payment_rate: Mapped[Decimal] = mapped_column(
+        Numeric(14, 2), nullable=False, default=Decimal("0.05")
+    )
     # Cross-registry reference to THIS SAME package's CashflowSheet.id /
     # SheetRow.id -- plain Integer, not a real FK, since a consuming app is
     # free to create a CreditCard before ever mapping it to a sheet row.
     # This is the sheet cell this card's monthly "total a pagar" gets
     # written onto -- set by `creditcard map`; sync_period() falls back to
     # these when the caller doesn't pass an explicit sheet/row of its own.
-    mapped_sheet_id = Column(Integer, nullable=True)
-    mapped_row_id = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    mapped_sheet_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    mapped_row_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
     # Physical-card metadata -- purely descriptive except `status`, which has
     # real behavior attached in a consuming app (e.g. a card that isn't
@@ -87,25 +91,25 @@ class CreditCard(Base):
     # Never store more than the last 4 digits or a full PAN/CVV -- this is a
     # personal finance tool, not a wallet; last4 is enough to recognize a
     # card in a bank statement.
-    last4 = Column(String(4), nullable=True)
+    last4: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
     # Month/year printed on the card -- day-normalized to the 1st, same
     # convention as CreditCardCharge.first_statement_period /
     # CreditCardStatement.billing_period (only the month/year is real).
-    expiration_date = Column(Date, nullable=True)
+    expiration_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     # Card network (Visa/Mastercard/Amex/...) -- free text, never a fixed
     # choices= list: not this package's job to keep up with every network.
-    network = Column(String(20), nullable=True)
-    holder_name = Column(String(100), nullable=True)
+    network: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    holder_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # active | expired | blocked | cancelled -- validated in application
     # code, not a DB CHECK constraint, same convention as
     # CreditCardStatement.source / StatementLine.line_type below.
-    status = Column(String(20), nullable=False, default="active")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
 
-    charges = relationship(
-        "CreditCardCharge", back_populates="credit_card", cascade="all, delete-orphan"
+    charges: Mapped[List["CreditCardCharge"]] = relationship(
+        back_populates="credit_card", cascade="all, delete-orphan"
     )
-    statements = relationship(
-        "CreditCardStatement", back_populates="credit_card", cascade="all, delete-orphan"
+    statements: Mapped[List["CreditCardStatement"]] = relationship(
+        back_populates="credit_card", cascade="all, delete-orphan"
     )
 
     @validates("status")
@@ -120,8 +124,8 @@ class CreditCard(Base):
 class CreditCardCharge(Base):
     __tablename__ = "credit_card_charges"
 
-    id = Column(Integer, primary_key=True, index=True)
-    credit_card_id = Column(Integer, ForeignKey("credit_cards.id"), nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    credit_card_id: Mapped[int] = mapped_column(ForeignKey("credit_cards.id"), nullable=False)
     # The WHOLE PURCHASE'S TOTAL, never a per-installment amount -- e.g. a
     # $1,200,000 purchase in 12 installments is stored as amount=1_200_000,
     # installments=12, never as the ~100k/month per-cuota figure. Contrast
@@ -134,24 +138,24 @@ class CreditCardCharge(Base):
     # Decimal(str(charge.amount)) call and, from there,
     # installment_schedule -> SheetCell, which are Numeric/Decimal throughout
     # the core engine.
-    amount = Column(Numeric(14, 2), nullable=False)
-    description = Column(String(255), nullable=True)
-    category = Column(String(100), nullable=True)
-    charge_date = Column(Date, nullable=False, default=date.today)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    category: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    charge_date: Mapped[date] = mapped_column(Date, nullable=False, default=date.today)
     # Installments (cuotas): total number of installments (1 = single charge)
-    installments = Column(Integer, nullable=False, default=1)
+    installments: Mapped[int] = mapped_column(nullable=False, default=1)
     # Number of installments already paid
-    installments_paid = Column(Integer, nullable=False, default=0)
+    installments_paid: Mapped[int] = mapped_column(nullable=False, default=0)
     # Which billing cycle installment #1 lands in -- day-normalized to the
     # 1st of the month, same convention as CreditCardStatement.billing_period
     # below. Nullable: a charge not (yet) tracked for statement projection
     # simply has no first_statement_period and is invisible to
     # compute_instant_statement()'s projection.
-    first_statement_period = Column(Date, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    first_statement_period: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
-    credit_card = relationship("CreditCard", back_populates="charges")
-    statement_lines = relationship("CreditCardStatementLine", back_populates="charge")
+    credit_card: Mapped["CreditCard"] = relationship(back_populates="charges")
+    statement_lines: Mapped[List["CreditCardStatementLine"]] = relationship(back_populates="charge")
 
 
 class CreditCardStatement(Base):
@@ -175,27 +179,27 @@ class CreditCardStatement(Base):
     __tablename__ = "credit_card_statements"
     __table_args__ = (UniqueConstraint("credit_card_id", "billing_period", name="uq_statement_period"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    credit_card_id = Column(Integer, ForeignKey("credit_cards.id"), nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    credit_card_id: Mapped[int] = mapped_column(ForeignKey("credit_cards.id"), nullable=False)
     # Cycle IDENTIFIER for lookups -- day-normalized to the 1st of the
     # month, same convention as opencashflow.models.SheetPeriod.period_date.
     # Distinct from closing_date/due_date below, which are the REAL calendar
     # dates printed on the statement.
-    billing_period = Column(Date, nullable=False)
+    billing_period: Mapped[date] = mapped_column(Date, nullable=False)
 
-    previous_balance = Column(Numeric(14, 2), nullable=True)
-    payments_received = Column(Numeric(14, 2), nullable=True)
+    previous_balance: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    payments_received: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
     # The bank's OWN printed total of new charges this cycle -- kept
     # separate from summing this statement's `lines` so a mismatch between
     # the two is detectable later, never silently reconciled.
-    new_charges_total = Column(Numeric(14, 2), nullable=True)
-    interest_charged = Column(Numeric(14, 2), nullable=True)
-    other_charges = Column(Numeric(14, 2), nullable=True)
+    new_charges_total: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    interest_charged: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    other_charges: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
     # The two numbers this whole feature exists to capture -- required.
-    new_balance = Column(Numeric(14, 2), nullable=False)
-    minimum_payment = Column(Numeric(14, 2), nullable=True)
+    new_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    minimum_payment: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
     # The number that feeds a SheetRow (see sync_period).
-    total_payment_due = Column(Numeric(14, 2), nullable=False)
+    total_payment_due: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     # "SALDO CAPITAL CUOTAS" as printed by the bank -- total remaining
     # PRINCIPAL (excluding future interest) across every active installment
     # plan on this card, as of this statement's closing date. An aggregate
@@ -206,24 +210,24 @@ class CreditCardStatement(Base):
     # Nullable: not every bank/month prints it; its absence must never block
     # recording a statement -- cupo_disponible() falls back to its own
     # installment_schedule-based estimate when this is None.
-    remaining_principal_installments = Column(Numeric(14, 2), nullable=True)
+    remaining_principal_installments: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
 
-    closing_date = Column(Date, nullable=False)
-    due_date = Column(Date, nullable=False)
-    currency = Column(String(3), nullable=False, default="USD")
+    closing_date: Mapped[date] = mapped_column(Date, nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     # "manual" | "pdf_import" -- enforced in application code, not a DB
     # CHECK constraint, matching how row_type/sign/override_type are
     # validated elsewhere in this package.
-    source = Column(String(20), nullable=False)
-    source_file = Column(String, nullable=True)
-    notes = Column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    source_file: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Plain int, not a ForeignKey -- see module docstring.
-    created_by = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by: Mapped[Optional[int]] = mapped_column(nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
-    credit_card = relationship("CreditCard", back_populates="statements")
-    lines = relationship(
-        "CreditCardStatementLine", back_populates="statement", cascade="all, delete-orphan"
+    credit_card: Mapped["CreditCard"] = relationship(back_populates="statements")
+    lines: Mapped[List["CreditCardStatementLine"]] = relationship(
+        back_populates="statement", cascade="all, delete-orphan"
     )
 
     @validates("source")
@@ -248,30 +252,30 @@ class CreditCardStatementLine(Base):
     __tablename__ = "credit_card_statement_lines"
     __table_args__ = (UniqueConstraint("charge_id", "installment_number", name="uq_charge_installment"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    statement_id = Column(Integer, ForeignKey("credit_card_statements.id"), nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    statement_id: Mapped[int] = mapped_column(ForeignKey("credit_card_statements.id"), nullable=False)
     # Populated only when this line is one installment of a tracked
     # multi-cuota CreditCardCharge -- nullable for a line the bank prints
     # that isn't (yet, or ever) linked back to a charge being tracked.
-    charge_id = Column(Integer, ForeignKey("credit_card_charges.id"), nullable=True)
+    charge_id: Mapped[Optional[int]] = mapped_column(ForeignKey("credit_card_charges.id"), nullable=True)
     # "charge" | "payment" | "credit" | "interest" | "fee"
-    line_type = Column(String(20), nullable=False)
+    line_type: Mapped[str] = mapped_column(String(20), nullable=False)
     # NULL for a non-installment line; 1/1 for a genuine single-payment
     # charge, for uniformity with a real multi-cuota charge's lines.
-    installment_number = Column(Integer, nullable=True)
-    installment_total = Column(Integer, nullable=True)
-    description = Column(String, nullable=False)
-    category = Column(String, nullable=True)
+    installment_number: Mapped[Optional[int]] = mapped_column(nullable=True)
+    installment_total: Mapped[Optional[int]] = mapped_column(nullable=True)
+    description: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # The ORIGINAL purchase date as printed on the line -- for cuota 3 of 12
     # this is NOT this statement's billing cycle date, it repeats every
     # month for the same purchase.
-    transaction_date = Column(Date, nullable=False)
+    transaction_date: Mapped[date] = mapped_column(Date, nullable=False)
     # The amount of THIS LINE as printed -- see class docstring.
-    amount = Column(Numeric(14, 2), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
-    statement = relationship("CreditCardStatement", back_populates="lines")
-    charge = relationship("CreditCardCharge", back_populates="statement_lines")
+    statement: Mapped["CreditCardStatement"] = relationship(back_populates="lines")
+    charge: Mapped[Optional["CreditCardCharge"]] = relationship(back_populates="statement_lines")
 
     @validates("line_type")
     def _validate_line_type(self, key: str, value: str) -> str:

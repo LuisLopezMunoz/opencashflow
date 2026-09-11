@@ -30,7 +30,7 @@ for an example spec file (see docs/examples/).
 import json
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union, cast
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -336,6 +336,14 @@ def import_sheet_spec(db: Session, spec: SheetSpec, user_id: int) -> CashflowShe
             .order_by(SheetPeriod.sort_order)
             .first()
         )
+        if first_period is None:
+            # Unreachable in practice -- generate_periods (called above) now
+            # raises ValueError for horizon_months <= 0, so a sheet reaching
+            # this point always has at least one period. Guarded explicitly
+            # anyway rather than trusting that invariant silently.
+            raise ValueError(
+                f"Sheet '{spec.sheet.name}' has no periods -- cannot write a seed_value."
+            )
         for section_spec in spec.sections:
             for row_spec in section_spec.rows:
                 if row_spec.seed_value is not None:
@@ -463,9 +471,17 @@ def export_sheet_spec(db: Session, sheet: CashflowSheet) -> SheetSpec:
                 _reverse_resolve_rule(row.default_projection_rule, id_to_name, row.name)
                 if row.default_projection_rule else None
             )
-            row_specs.append(RowSpec(name=row.name, row_type=row.row_type, sign=row.sign, rule=rule_spec))
+            # cast, not a real runtime check: SheetRow/SheetSection's own
+            # @validates hooks (models.py) already guarantee these strings
+            # are members of ROW_TYPES/ROW_SIGNS/SECTION_TYPES for any row
+            # that made it into the database at all -- mypy just can't see
+            # across that boundary from a plain Mapped[str] column.
+            row_specs.append(RowSpec(
+                name=row.name, row_type=cast(RowType, row.row_type),
+                sign=cast(RowSign, row.sign), rule=rule_spec,
+            ))
         section_specs.append(SectionSpec(
-            name=section.name, section_type=section.section_type, rows=row_specs,
+            name=section.name, section_type=cast(SectionType, section.section_type), rows=row_specs,
         ))
 
     return SheetSpec(

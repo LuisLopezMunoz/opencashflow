@@ -22,6 +22,16 @@ already has something more recent on top of this movement's own write (a
 later record, or a second movement) -- popping the wrong thing would
 silently corrupt an unrelated later fact instead of reversing this specific
 event.
+
+Neither write function commits its own transaction -- both only flush (same
+convention as record_stack.pop_record_stack, the lower-level primitive this
+module already calls). Committing used to happen inside each function,
+which meant the "a bill split across two wallets" example two paragraphs up
+could never actually be atomic: if the second do_wallet_movement_add call
+failed, the first was already permanently committed. The caller now decides
+the transaction boundary -- call db.commit() once after every write in the
+same logical operation has succeeded, or db.rollback() if any of them
+raised.
 """
 import dataclasses
 from decimal import Decimal
@@ -101,7 +111,10 @@ def do_wallet_movement_add(
         actual_entry_id=entry.id, note=note, created_by=created_by,
     )
     db.add(movement)
-    db.commit()
+    # Flush, not commit -- see the module docstring: the caller decides the
+    # transaction boundary, so this composes with other writes in the same
+    # logical operation instead of forcing each one to commit in isolation.
+    db.flush()
     db.refresh(movement)
     db.refresh(wallet)
 
@@ -157,8 +170,12 @@ def do_wallet_movement_undo(
         note=note, created_by=created_by,
     )
     db.add(reversal)
+    # Flush, not commit -- see the module docstring. The unique-constraint
+    # violation this guards against is raised at flush time (the INSERT
+    # actually runs then), same as it would be at commit time -- no change
+    # to when this can fail, only to who decides the transaction boundary.
     try:
-        db.commit()
+        db.flush()
     except IntegrityError:
         # The plain SELECT-based "already reversed" check above has a real
         # TOCTOU race: two concurrent undo calls on the same movement can

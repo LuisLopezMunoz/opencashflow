@@ -294,3 +294,55 @@ def test_undo_and_add_reject_a_closed_period(db, built):
         do_wallet_movement_add(db, wallet, built["sheet"].id, sueldo, period, Decimal("1"), note=None, created_by=TEST_USER_ID)
     with pytest.raises(ValueError, match="already-closed"):
         do_wallet_movement_undo(db, added.movement, note=None, created_by=TEST_USER_ID)
+
+
+# ---------------------------------------------------------------------------
+# Composability -- do_wallet_movement_add/_undo used to commit their own
+# transaction internally, which made the module's own "a bill split across
+# two wallets" example impossible to make atomic: if the second call
+# failed, the first was already permanently committed. Neither function
+# commits anymore (only flushes); the caller decides the transaction
+# boundary. This proves it actually works now, not just that no existing
+# test broke.
+# ---------------------------------------------------------------------------
+
+def test_two_movements_can_be_composed_into_one_atomic_transaction(db, built):
+    """A bill split across two wallets, exactly as the module docstring
+    describes -- both succeed, one db.commit() covers both."""
+    wallet, sueldo, period = built["wallet"], built["sueldo"], built["period1"]
+    second_wallet = Wallet(user_id=TEST_USER_ID, name="Cuenta RUT", wallet_type="bank", currency="CLP", balance=0)
+    db.add(second_wallet)
+    db.flush()
+
+    do_wallet_movement_add(db, wallet, built["sheet"].id, sueldo, period, Decimal("300000"),
+                            note="mitad 1", created_by=TEST_USER_ID)
+    do_wallet_movement_add(db, second_wallet, built["sheet"].id, sueldo, period, Decimal("200000"),
+                            note="mitad 2", created_by=TEST_USER_ID)
+    db.commit()
+
+    assert db.query(WalletMovement).count() == 2
+    db.refresh(wallet)
+    db.refresh(second_wallet)
+    assert wallet.balance == Decimal("400000")  # 100_000 fixture balance + 300_000
+    assert second_wallet.balance == Decimal("200000")
+
+
+def test_failed_second_movement_leaves_the_first_uncommitted(db, built):
+    """The actual point of the fix: if the second call in a composed
+    operation raises, rolling back must undo BOTH -- including the first
+    one, which succeeded and was flushed but never independently
+    committed."""
+    wallet, sueldo, huerfana, period = built["wallet"], built["sueldo"], built["huerfana"], built["period1"]
+
+    do_wallet_movement_add(db, wallet, built["sheet"].id, sueldo, period, Decimal("300000"),
+                            note="mitad 1", created_by=TEST_USER_ID)
+    with pytest.raises(ValueError, match="sum_rows"):
+        # huerfana has no aggregation path -- do_wallet_movement_add rejects
+        # it, simulating the second half of a composed operation failing.
+        do_wallet_movement_add(db, wallet, built["sheet"].id, huerfana, period, Decimal("1"),
+                                note="mitad 2", created_by=TEST_USER_ID)
+    db.rollback()
+
+    assert db.query(WalletMovement).count() == 0
+    db.refresh(wallet)
+    assert wallet.balance == Decimal("100000")  # fixture's original balance, untouched

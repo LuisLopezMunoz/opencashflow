@@ -27,7 +27,7 @@ without this module needing to know what that category means.
 """
 import dataclasses
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -174,6 +174,15 @@ class InstantStatement:
     is_real: bool
     lines: List[InstantStatementLine]
     charges_due_this_cycle: Decimal
+    # This cycle's interest charge and minimum payment due. When is_real,
+    # both are read straight off the real statement (CreditCardStatement.
+    # interest_charged/minimum_payment, exactly as the bank printed them --
+    # None if the bank's own statement didn't report one). When NOT real,
+    # both are a projection (see _project_interest_and_minimum_payment) --
+    # None for either whenever previous_balance_known is False, since
+    # neither can be estimated without knowing what's actually owed.
+    interest: Optional[Decimal] = None
+    minimum_payment: Optional[Decimal] = None
 
 
 def _installment_number_for_period(first_statement_period: date, period: date) -> Optional[int]:
@@ -187,6 +196,21 @@ def _installment_number_for_period(first_statement_period: date, period: date) -
     if months_diff < 0:
         return None
     return months_diff + 1
+
+
+def _first_statement_period(charge: CreditCardCharge) -> date:
+    """charge.first_statement_period, asserted non-None. The column itself
+    is legitimately nullable (a charge not yet tracked for statement
+    projection has none) -- but every caller here only ever iterates
+    charges already filtered through _active_charges(), which excludes
+    first_statement_period IS NULL at the SQL level. mypy can't see that
+    guarantee through a query filter alone; this makes it explicit once,
+    instead of scattering `assert ... is not None` at every call site."""
+    assert charge.first_statement_period is not None, (
+        f"CreditCardCharge #{charge.id} has no first_statement_period -- caller should have "
+        f"filtered via _active_charges() before reaching here."
+    )
+    return charge.first_statement_period
 
 
 def _find_statement(db: Session, card_id: int, billing_period: date) -> Optional[CreditCardStatement]:
@@ -209,6 +233,49 @@ def _active_charges(db: Session, card_id: int) -> List[CreditCardCharge]:
         db.query(CreditCardCharge)
         .filter(CreditCardCharge.credit_card_id == card_id, CreditCardCharge.first_statement_period.isnot(None))
         .all()
+    )
+
+
+def _project_interest_and_minimum_payment(
+    card: CreditCard, previous_balance: Optional[Decimal], previous_balance_known: bool,
+    charges_due_this_cycle: Decimal,
+) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    """(interest, minimum_payment) projected for a NOT-YET-REAL cycle, or
+    (None, None) whenever previous_balance isn't known -- never guessed
+    against an unknown prior balance, same discipline previous_balance_known
+    already enforces on previous_balance itself.
+
+    WARNING: both are ASSUMED conventions, unconfirmed against any real
+    bank statement -- same spirit as installment_schedule's own warning
+    above. Once a real CreditCardStatement exists for a cycle,
+    compute_instant_statement's real branch uses its own
+    interest_charged/minimum_payment directly instead, and this projection
+    is never consulted for that cycle again.
+      - interest = previous_balance * (card.interest_rate / 12): simple
+        (non-compounding) interest on last cycle's ending balance, at 1/12
+        of the stored ANNUAL rate. Does not distinguish a revolving balance
+        from principal still being paid off in installments (whose cuota
+        already has any bank-side interest folded in) -- some issuers may
+        only charge interest on the former, which this can't tell apart.
+      - minimum_payment = card.minimum_payment_rate * (previous_balance +
+        charges_due_this_cycle): the rate applied to what will be owed once
+        this cycle's own new charges land, deliberately NOT including this
+        same projected interest (real minimum-payment formulas vary in
+        whether they fold interest into their own base, and there is no
+        real statement here to confirm which way a given issuer does it).
+    Both quantized to 2 decimals (Decimal("0.01"), ROUND_HALF_UP), matching
+    every other money value in this package.
+    """
+    if not previous_balance_known or previous_balance is None:
+        return None, None
+    cents = Decimal("0.01")
+    monthly_rate = card.interest_rate / Decimal(12)
+    interest = (previous_balance * monthly_rate) if previous_balance > 0 else Decimal("0")
+    balance_owed = previous_balance + charges_due_this_cycle
+    minimum_payment = card.minimum_payment_rate * balance_owed
+    return (
+        interest.quantize(cents, rounding=ROUND_HALF_UP),
+        minimum_payment.quantize(cents, rounding=ROUND_HALF_UP),
     )
 
 
@@ -243,6 +310,8 @@ def compute_instant_statement(db: Session, card: CreditCard, period: date) -> In
             is_real=True,
             lines=lines,
             charges_due_this_cycle=real_statement.total_payment_due,
+            interest=real_statement.interest_charged,
+            minimum_payment=real_statement.minimum_payment,
         )
 
     # --- Not real yet: previous_balance comes from the most recent real
@@ -260,11 +329,11 @@ def compute_instant_statement(db: Session, card: CreditCard, period: date) -> In
     # first_statement_period whose Nth cuota lands in this exact period,
     # skipping any (charge_id, installment_number) already accounted for by
     # a REAL line on some other already-real statement (never double count).
-    lines: List[InstantStatementLine] = []
+    projected_lines: List[InstantStatementLine] = []
     charges_due_this_cycle = Decimal("0")
     charges = _active_charges(db, card.id)
     for charge in charges:
-        installment_number = _installment_number_for_period(charge.first_statement_period, billing_period_norm)
+        installment_number = _installment_number_for_period(_first_statement_period(charge), billing_period_norm)
         if installment_number is None or installment_number > charge.installments:
             continue  # this charge hasn't started yet, or has already fully cycled through
 
@@ -281,7 +350,7 @@ def compute_instant_statement(db: Session, card: CreditCard, period: date) -> In
 
         schedule = installment_schedule(Decimal(str(charge.amount)), charge.installments)
         amount = schedule[installment_number - 1]
-        lines.append(InstantStatementLine(
+        projected_lines.append(InstantStatementLine(
             description=charge.description or "(sin descripción)",
             amount=amount,
             installment_number=installment_number,
@@ -290,14 +359,19 @@ def compute_instant_statement(db: Session, card: CreditCard, period: date) -> In
         ))
         charges_due_this_cycle += amount
 
+    interest, minimum_payment = _project_interest_and_minimum_payment(
+        card, previous_balance, previous_balance_known, charges_due_this_cycle,
+    )
     return InstantStatement(
         card=card,
         period=period_norm,
         previous_balance=previous_balance,
         previous_balance_known=previous_balance_known,
         is_real=False,
-        lines=lines,
+        lines=projected_lines,
         charges_due_this_cycle=charges_due_this_cycle,
+        interest=interest,
+        minimum_payment=minimum_payment,
     )
 
 
@@ -328,7 +402,9 @@ def _remaining_committed(charge: CreditCardCharge, current_open_billing_period: 
     full (see cupo_disponible's docstring for why that assumption is
     printed, never silent)."""
     schedule = installment_schedule(Decimal(str(charge.amount)), charge.installments)
-    installment_number = _installment_number_for_period(charge.first_statement_period, current_open_billing_period)
+    installment_number = _installment_number_for_period(
+        _first_statement_period(charge), current_open_billing_period,
+    )
     already_closed = 0 if installment_number is None else max(0, installment_number - 1)
     return sum(schedule[min(already_closed, len(schedule)):], Decimal("0"))
 
@@ -385,7 +461,7 @@ def _cupo_disponible_detail(db: Session, card: CreditCard, today: date) -> Tuple
         # before a new statement exists) would report the same room as
         # still free and let it be drawn twice.
         newly_committed = sum(
-            (_remaining_committed(c, current_open) for c in charges if c.first_statement_period >= current_open),
+            (_remaining_committed(c, current_open) for c in charges if _first_statement_period(c) >= current_open),
             Decimal("0"),
         )
         return Decimal(str(card.credit_limit)) - real - newly_committed, False
@@ -465,7 +541,8 @@ def _cupo_disponible_real_ahora(
     charges = _active_charges(db, card.id)
     new_real_charges = sum(
         (_remaining_committed(c, current_open) for c in charges
-         if c.first_statement_period >= current_open and (exclude_category is None or c.category != exclude_category)),
+         if _first_statement_period(c) >= current_open
+         and (exclude_category is None or c.category != exclude_category)),
         Decimal("0"),
     )
 
@@ -474,7 +551,7 @@ def _cupo_disponible_real_ahora(
         return Decimal(str(card.credit_limit)) - real_principal - unpaid_last_bill - new_real_charges, False
 
     pre_existing = sum(
-        (_remaining_committed(c, current_open) for c in charges if c.first_statement_period < current_open),
+        (_remaining_committed(c, current_open) for c in charges if _first_statement_period(c) < current_open),
         Decimal("0"),
     )
     return Decimal(str(card.credit_limit)) - pre_existing - unpaid_last_bill - new_real_charges, True
