@@ -49,6 +49,7 @@ from opencashflow.credit_card import CreditCard
 from opencashflow.creditcard_statements import (
     _cupo_disponible_detail,
     _cupo_disponible_real_ahora,
+    compute_instant_statement,
     resolve_credit_card,
 )
 from opencashflow.engine import (
@@ -68,7 +69,7 @@ from opencashflow.models import (
     SheetSection,
 )
 from opencashflow.period_close import AGGREGATE_ROW_TYPES as _AGGREGATE_ROW_TYPES
-from opencashflow.period_close import CloseReport, close_period
+from opencashflow.period_close import CloseReport, ReopenReport, close_period, reopen_period
 from opencashflow.period_close import find_balance_row as _find_balance_row_or_raise
 from opencashflow.periods import extend_periods_backward, find_anchor_period, generate_periods
 from opencashflow.record_stack import (
@@ -1065,6 +1066,8 @@ def _do_set_override(
     Commits once at the end. Every write supersedes any existing active
     override on that cell first (see _supersede_and_write_override).
     """
+    _guard_periods_not_closed(periods, "escribir un override")
+
     captured_by_period: Dict[int, Optional[Decimal]] = {}
     if lock:
         result = compute_sheet(sheet_id, db)
@@ -1117,6 +1120,8 @@ def _do_clear_override(db, sheet_id: int, row: SheetRow, periods: List[SheetPeri
     what each cell's value reverted to -- its own rule's result, or None
     ("sin valor") if it has none -- which is the whole point of the command.
     """
+    _guard_periods_not_closed(periods, "limpiar un override")
+
     results: List[OverrideClearResult] = []
     for period in periods:
         cell = db.query(SheetCell).filter(SheetCell.row_id == row.id, SheetCell.period_id == period.id).first()
@@ -2231,6 +2236,44 @@ def cmd_period_close(db, args) -> None:
     _print_close_report(report)
 
 
+def _print_reopen_report(report: ReopenReport) -> None:
+    if report.dry_run:
+        print("[DRY RUN -- nada se guardó]")
+
+    print(f"[OK] Reapertura de {report.period_label} -- planilla #{report.sheet_id}")
+    print(f"  {report.balance_final_row_name}: vuelve a calcularse por su propia regla (ya no está congelado)")
+
+    if report.touched_notes:
+        print("  [aviso] esto NO deshace lo siguiente por sí solo -- revisar y resolver a mano si corresponde:")
+        for note in report.touched_notes:
+            print(f"    - {note}")
+    else:
+        print("  (sin otros rastros del cierre original que revisar)")
+
+
+def cmd_period_reopen(db, args) -> None:
+    sheet = _pick_sheet(db, args.sheet_id)
+
+    period_date = _parse_base_period(args.period)
+    period_dt = datetime(period_date.year, period_date.month, 1)
+    period = db.query(SheetPeriod).filter(
+        SheetPeriod.sheet_id == sheet.id, SheetPeriod.period_date == period_dt,
+    ).first()
+    if not period:
+        print(f"La planilla #{sheet.id} no tiene un período para {period_dt.strftime('%Y-%m')}.", file=sys.stderr)
+        sys.exit(1)
+
+    balance_row = _resolve_row(db, sheet.id, args.balance_row) if args.balance_row else None
+
+    try:
+        report = reopen_period(db, sheet, period, balance_row=balance_row, dry_run=args.dry_run)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    _print_reopen_report(report)
+
+
 # ---------------------------------------------------------------------------
 # creditcard: card / charge / statement / sync
 # ---------------------------------------------------------------------------
@@ -2396,6 +2439,12 @@ def cmd_wallet_movement_add(db, args) -> None:
     except ValueError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
+    # do_wallet_movement_add only flushes now (see its own module docstring
+    # -- it used to commit internally, which made composing several
+    # movements into one atomic transaction impossible) -- a single-command
+    # CLI invocation like this one is its own whole transaction, so this is
+    # the caller committing it.
+    db.commit()
 
     m = result.movement
     sign_text = "+" if m.amount >= 0 else "-"
@@ -2427,6 +2476,9 @@ def cmd_wallet_movement_undo(db, args) -> None:
     except ValueError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
+    # See cmd_wallet_movement_add's own comment -- do_wallet_movement_undo
+    # only flushes now, the caller commits.
+    db.commit()
 
     print(
         f"[OK] Se deshizo el movimiento #{movement.id} (billetera [{wallet.id}] {wallet.name}): "
@@ -2669,6 +2721,55 @@ def cmd_creditcard_cupo(db, args) -> None:
         "  'Para planificar' = una cifra pareja que asume el ciclo recién cerrado ya pagado (para no "
         "ofrecer el mismo cupo dos veces)."
     )
+
+
+
+
+def cmd_creditcard_statement(db, args) -> None:
+    """Muestra el estado de cuenta 'instantáneo' de una tarjeta para un mes
+    dado: real si el banco ya reportó el ciclo correspondiente, proyectado
+    si no. Incluye interés y pago mínimo -- real, lo que el banco informó;
+    proyectado, una estimación simple (interés no compuesto sobre el saldo
+    anterior, pago mínimo = tasa x saldo adeudado) marcada explícitamente
+    como no confirmada contra un estado de cuenta real, y como None (no
+    disponible) cuando el saldo anterior mismo no se conoce."""
+    card = _resolve_creditcard_or_exit(db, args.card)
+    period_date = _parse_base_period(args.period) if args.period else date.today().replace(day=1)
+
+    try:
+        statement = compute_instant_statement(db, card, period_date)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    tag = "real" if statement.is_real else "proyectado"
+    print(f"{card.name} [{card.id}] -- {period_date.strftime('%Y-%m')} ({tag})")
+    if not statement.previous_balance_known:
+        print("  Saldo anterior: desconocido -- interés y pago mínimo no se pueden proyectar todavía.")
+    else:
+        print(f"  Saldo anterior: {_fmt_number(statement.previous_balance, args.unit)}")
+    print(f"  Cargos de este ciclo: {_fmt_number(statement.charges_due_this_cycle, args.unit)}")
+
+    interest_text = (
+        _fmt_number(statement.interest, args.unit) if statement.interest is not None else "-- (no disponible)"
+    )
+    min_pay_text = (
+        _fmt_number(statement.minimum_payment, args.unit) if statement.minimum_payment is not None else "-- (no disponible)"
+    )
+    print(f"  Interés {'cobrado' if statement.is_real else 'proyectado'}: {interest_text}")
+    print(f"  Pago mínimo {'informado' if statement.is_real else 'proyectado'}: {min_pay_text}")
+    if not statement.is_real and statement.previous_balance_known:
+        print(
+            "  [aviso] proyección no confirmada contra un estado de cuenta real -- interés simple no "
+            "compuesto sobre el saldo anterior, pago mínimo = tasa x (saldo anterior + cargos)."
+        )
+
+    if statement.lines:
+        print("  Líneas:")
+        for line in statement.lines:
+            cuota = f"  cuota {line.installment_number}/{line.installment_total}" if line.installment_number else ""
+            marca = " (proyectada)" if line.is_projected else ""
+            print(f"    - {line.description}: {_fmt_number(line.amount, args.unit)}{cuota}{marca}")
 
 
 
@@ -3477,6 +3578,18 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
     )
     p_period_close.add_argument("--user-id", type=int, default=None, help="Default: el dueño de la planilla")
 
+    p_period_reopen = period_sub.add_parser(
+        "reopen",
+        help="Reabrir un período cerrado: descongela el saldo final para que vuelva a calcularse por su regla",
+    )
+    p_period_reopen.add_argument("--sheet-id", type=int, default=None, help="Default: la planilla creada más recientemente")
+    p_period_reopen.add_argument("--period", type=str, required=True, help="Mes YYYY-MM a reabrir")
+    p_period_reopen.add_argument("--dry-run", action="store_true", help="Muestra qué pasaría, sin escribir nada")
+    p_period_reopen.add_argument(
+        "--balance-row", type=str, default=None,
+        help="Nombre (o parte) o row_id de la fila de saldo inicial (solo necesario si la auto-detección es ambigua)",
+    )
+
     # "wizard" is split: edit is generic (registered here); "new" is
     # app-specific (creates a sheet owned by a private User) -- a
     # consuming app adds it onto wizard_sub.
@@ -3574,6 +3687,13 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
         help="Nombre (o parte) o id de la tarjeta (default: todas las mapeadas a una planilla)",
     )
     p_cc_cupo.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
+
+    p_cc_statement = creditcard_sub.add_parser(
+        "statement", help="Estado de cuenta instantáneo (real o proyectado): incluye interés y pago mínimo",
+    )
+    p_cc_statement.add_argument("--card", type=str, required=True, help="Nombre (o parte) o id de la tarjeta")
+    p_cc_statement.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (default: el mes actual)")
+    p_cc_statement.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
 
     p_cc_edit = creditcard_sub.add_parser("edit", help="Editar una tarjeta existente (actualización parcial)")
     p_cc_edit.add_argument("--card", type=str, required=True, help="Nombre (o parte) o id de la tarjeta")
@@ -3725,6 +3845,8 @@ def main() -> None:
         elif args.command == "period":
             if args.period_command == "close":
                 cmd_period_close(db, args)
+            elif args.period_command == "reopen":
+                cmd_period_reopen(db, args)
         elif args.command == "wizard":
             if args.wizard_command == "edit":
                 cmd_wizard_edit(db, args)
@@ -3745,6 +3867,8 @@ def main() -> None:
                 cmd_creditcard_edit(db, args)
             elif args.creditcard_command == "cupo":
                 cmd_creditcard_cupo(db, args)
+            elif args.creditcard_command == "statement":
+                cmd_creditcard_statement(db, args)
             elif args.creditcard_command == "map":
                 cmd_creditcard_map(db, args)
     finally:

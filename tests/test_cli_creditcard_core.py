@@ -15,8 +15,12 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from opencashflow.cli import cmd_creditcard_cupo, cmd_creditcard_edit, cmd_creditcard_list, cmd_creditcard_map
-from opencashflow.credit_card import CreditCard
+from decimal import Decimal
+
+from opencashflow.cli import (
+    cmd_creditcard_cupo, cmd_creditcard_edit, cmd_creditcard_list, cmd_creditcard_map, cmd_creditcard_statement,
+)
+from opencashflow.credit_card import CreditCard, CreditCardStatement, CreditCardStatementLine
 from opencashflow.models import Base, CashflowSheet, SheetPeriod, SheetRow, SheetSection
 
 TEST_USER_ID = 1
@@ -198,3 +202,73 @@ def test_cmd_creditcard_cupo_flags_non_active_status(db, card, capsys):
     db.commit()
     cmd_creditcard_cupo(db, NS(card="Tarjeta CLI", unit="1"))
     assert "estado=blocked" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# cmd_creditcard_statement
+#
+# `card`'s closing_day=25/due_day=28 means due_day > closing_day, so
+# _payment_lag_months(card) == 0 -- the payment period passed via --period
+# equals the billing period directly, no month-shift arithmetic needed here.
+# ---------------------------------------------------------------------------
+
+def test_cmd_creditcard_statement_previous_balance_unknown(db, card, capsys):
+    cmd_creditcard_statement(db, NS(card="Tarjeta CLI", period="2026-01", unit="1"))
+    out = capsys.readouterr().out
+    assert "(proyectado)" in out
+    assert "desconocido" in out
+    assert out.count("no disponible") == 2
+
+
+def test_cmd_creditcard_statement_real(db, card, capsys):
+    stmt = CreditCardStatement(
+        credit_card_id=card.id, billing_period=date(2026, 1, 1),
+        previous_balance=Decimal("200000"), payments_received=Decimal("200000"),
+        new_charges_total=Decimal("90000"), interest_charged=Decimal("4123"),
+        other_charges=Decimal("0"), new_balance=Decimal("94123"), minimum_payment=Decimal("15000"),
+        total_payment_due=Decimal("94123"), currency="CLP", source="manual",
+        closing_date=date(2026, 1, 25), due_date=date(2026, 1, 28),
+    )
+    db.add(stmt)
+    db.flush()
+    db.add(CreditCardStatementLine(
+        statement_id=stmt.id, description="Compra supermercado", amount=Decimal("90000"),
+        installment_number=1, installment_total=1, line_type="charge",
+        transaction_date=date(2026, 1, 10),
+    ))
+    db.commit()
+
+    cmd_creditcard_statement(db, NS(card="Tarjeta CLI", period="2026-01", unit="1"))
+    out = capsys.readouterr().out
+    assert "(real)" in out
+    assert "Saldo anterior: 200.000" in out
+    assert "Interés cobrado: 4.123" in out
+    assert "Pago mínimo informado: 15.000" in out
+    assert "Compra supermercado" in out
+
+
+def test_cmd_creditcard_statement_projected_with_known_previous_balance(db, card, capsys):
+    stmt = CreditCardStatement(
+        credit_card_id=card.id, billing_period=date(2026, 1, 1),
+        previous_balance=Decimal("0"), payments_received=Decimal("0"),
+        new_charges_total=Decimal("100000"), interest_charged=Decimal("0"),
+        other_charges=Decimal("0"), new_balance=Decimal("100000"), minimum_payment=Decimal("5000"),
+        total_payment_due=Decimal("100000"), currency="CLP", source="manual",
+        closing_date=date(2026, 1, 25), due_date=date(2026, 1, 28),
+    )
+    db.add(stmt)
+    db.commit()
+
+    cmd_creditcard_statement(db, NS(card="Tarjeta CLI", period="2026-02", unit="1"))
+    out = capsys.readouterr().out
+    assert "(proyectado)" in out
+    assert "Saldo anterior: 100.000" in out
+    # interest_rate=0.1/year on the card fixture -> 100000 * 0.1 / 12 = 833.33
+    assert "Interés proyectado: 833" in out
+    assert "no confirmada contra un estado de cuenta real" in out
+
+
+def test_cmd_creditcard_statement_card_not_found_exits(db, capsys):
+    with pytest.raises(SystemExit):
+        cmd_creditcard_statement(db, NS(card="no existe", period="2026-01", unit="1"))
+    assert "No se encontró" in capsys.readouterr().err
