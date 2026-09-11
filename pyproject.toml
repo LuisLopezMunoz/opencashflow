@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opencashflow"
-version = "0.12.0"
+version = "0.13.0"
 description = "Motor de proyección de flujo de caja: modelos SQLAlchemy, engine de cálculo y schemas Pydantic, agnóstico de framework web y de ledger."
 readme = "README.md"
 license = "Apache-2.0"
@@ -69,19 +69,22 @@ ignore = ["E501"]
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
-# Scoped to files that already have some type-hint discipline, or that a
-# remediation phase has just touched. Widen this list as more of the
-# codebase gets typed -- a whole-repo strict run on day one would surface
-# hundreds of pre-existing gaps unrelated to any specific change.
-files = [
-    "src/opencashflow/enums.py",
-    "src/opencashflow/models.py",
+# Whole core now, cli.py/cli_export.py excluded to match ruff's own
+# extend-exclude above (out of scope, reviewed/maintained separately).
+# This used to be a narrow files=[enums.py, models.py] allowlist: every
+# model in this package used the legacy Column(...) declarative style,
+# under which mypy sees every ORM instance attribute as Column[X] instead
+# of X, no matter what Base is -- reading one from engine.py/period_close.py/
+# etc. flooded mypy with ~90 spurious "Column[int] vs int" errors unrelated
+# to any real bug. Migrating every model to SQLAlchemy 2.0's Mapped[]/
+# mapped_column() style (see MIGRATIONS.md/git history) fixed that at the
+# root instead of working around it file by file; the ~25 real errors that
+# migration then surfaced (genuine null-safety gaps, a couple of variable-
+# name collisions across loops, two `str` vs Literal[...] boundary casts)
+# were fixed alongside it, so this list could go straight to "everything
+# except the CLI" rather than growing one file at a time.
+files = ["src/opencashflow"]
+exclude = [
+    "^src/opencashflow/cli\\.py$",
+    "^src/opencashflow/cli_export\\.py$",
 ]
-# Widening this list to a file that READS ORM instance attributes (engine.py,
-# period_close.py, periods.py, ...) currently floods mypy with ~90 spurious
-# "Column[int] vs int" errors: every model here uses the legacy Column(...)
-# declarative style rather than SQLAlchemy 2.0's Mapped[]/mapped_column(),
-# and mypy can't infer instance-attribute types from a plain Column() without
-# either that migration or a plugin -- sqlalchemy2-stubs is deprecated for
-# 2.0 and does not fix this. Widening further needs that migration first,
-# not just adding more files here.
