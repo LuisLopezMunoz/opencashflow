@@ -145,6 +145,35 @@ def test_extend_periods_backward_skips_a_date_that_already_exists(db):
     assert len(all_dates) == len(set(all_dates))  # no duplicate Aug row
 
 
+def test_extend_periods_backward_pivot_always_beats_an_out_of_band_sort_order(db):
+    """The documented "sort_order collision" risk (PENDIENTES.md) doesn't
+    actually reach extend_periods_backward itself: `earliest` is always
+    recomputed as sheet.periods' TRUE minimum sort_order at call time, and
+    every value the walk assigns is strictly less than that minimum -- so
+    it can never equal an existing one, no matter how an out-of-band period
+    got its sort_order. A period with a lower sort_order just becomes the
+    new pivot (as here), it doesn't get collided with. This test pins that
+    down so it doesn't silently regress; the actual gap this risk points at
+    (nothing at the DB level enforces sort_order uniqueness at all, so some
+    OTHER path entirely could still violate it) is closed instead by
+    SheetPeriod's uq_period_sort_order constraint -- see test_models.py."""
+    sheet = _make_sheet(db, months=1, base_period=datetime(2026, 9, 1))  # sort_order=0
+    db.add(SheetPeriod(sheet_id=sheet.id, period_date=datetime(2025, 8, 1),
+                        label="Out of band", is_closed=True, sort_order=-1))
+    db.commit()
+
+    created = extend_periods_backward(sheet, months=2, db=db)
+    db.commit()
+
+    # The out-of-band period (sort_order=-1) became the new pivot -- the
+    # walk continues from ITS date (Aug 2025), not from a naive Sep-2026-
+    # minus-1 assumption, and lands on sort_order values below -1.
+    assert _dates(created) == [datetime(2025, 7, 1), datetime(2025, 6, 1)]
+    sort_orders = [p.sort_order for p in sheet.periods]
+    assert len(set(sort_orders)) == len(sort_orders), f"sort_order collision: {sort_orders}"
+    assert sorted(sort_orders) == [-3, -2, -1, 0]
+
+
 def test_extend_periods_backward_is_composable_across_successive_calls(db):
     sheet = _make_sheet(db, months=1, base_period=datetime(2026, 9, 1))
 

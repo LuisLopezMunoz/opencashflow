@@ -193,3 +193,45 @@ def test_deleting_a_wallet_does_not_cascade_to_movements(db):
     db.commit()
 
     assert db.query(WalletMovement).filter_by(id=movement_id).first() is not None
+
+
+# ---------------------------------------------------------------------------
+# Unique constraints -- confirming the DB itself backstops these invariants
+# (IntegrityError, not just "the application never happens to write a
+# duplicate"), same discipline as
+# test_wallet_movements.test_reverses_movement_id_is_unique_at_the_db_level.
+# ---------------------------------------------------------------------------
+
+def test_uq_sheet_period_rejects_a_duplicate_period_date(db):
+    ids = _full_chain(db)
+    sheet = ids["sheet"]
+
+    db.add(SheetPeriod(sheet_id=sheet.id, period_date=ids["period"].period_date,
+                        label="Duplicate", sort_order=1))
+    with pytest.raises(Exception, match="UNIQUE"):
+        db.commit()
+    db.rollback()
+
+
+def test_uq_period_sort_order_rejects_a_duplicate_sort_order(db):
+    """Closes the gap the second-pass audit flagged: nothing at the DB level
+    used to stop two periods on the same sheet from sharing a sort_order,
+    which close_period/reopen_period's ordering guards (strict </>) both
+    depend on being impossible."""
+    ids = _full_chain(db)
+    sheet = ids["sheet"]
+
+    db.add(SheetPeriod(sheet_id=sheet.id, period_date=datetime(2026, 2, 1),
+                        label="P1", sort_order=ids["period"].sort_order))
+    with pytest.raises(Exception, match="UNIQUE"):
+        db.commit()
+    db.rollback()
+
+
+def test_uq_cell_rejects_a_duplicate_row_period_pair(db):
+    ids = _full_chain(db)
+
+    db.add(SheetCell(row_id=ids["row"].id, period_id=ids["period"].id))
+    with pytest.raises(Exception, match="UNIQUE"):
+        db.commit()
+    db.rollback()

@@ -14,6 +14,30 @@ with the exact DDL and a copy-pasteable SQLite snippet. A runnable script lives 
 
 ---
 
+## v0.13.0
+
+### `sheet_periods`: new unique index on `(sheet_id, sort_order)`
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS uq_period_sort_order
+    ON sheet_periods (sheet_id, sort_order);
+```
+
+`close_period`/`reopen_period`'s ordering guards ("earlier periods must already
+be closed" / "no later period may already be closed") compare `sort_order` with
+strict `<`/`>` -- that only means anything if `sort_order` is a genuine total
+order with no ties on a given sheet. A second-pass technical-debt audit flagged
+this as a latent risk; tracing through `periods.extend_periods_backward` showed
+it can't actually produce a collision itself (its pivot is always recomputed as
+the sheet's true minimum `sort_order` at call time, and it only ever assigns
+values strictly below that), but nothing at the DB level enforced the invariant
+against any OTHER path -- a future write, or a direct manual edit. Run via
+`migrations/0003_period_sort_order_unique.py`, which checks for any existing
+duplicate first and refuses to proceed (printing exactly which rows) rather
+than fail with a generic SQLite error if one is somehow already there.
+
+---
+
 ## v0.12.0
 
 Three schema changes landed together in one batch, on purpose — see the project's
@@ -87,10 +111,12 @@ many rows it reclassified).
 cp ~/.local/share/opencashflow/opencashflow.db /tmp/opencashflow-migration-test.db
 DATABASE_URL="sqlite:////tmp/opencashflow-migration-test.db" python migrations/0001_wallet_movement_indexes.py
 DATABASE_URL="sqlite:////tmp/opencashflow-migration-test.db" python migrations/0002_cell_actual_entry_entry_kind.py
+DATABASE_URL="sqlite:////tmp/opencashflow-migration-test.db" python migrations/0003_period_sort_order_unique.py
 
 # Only once the copy checks out:
 DATABASE_URL="sqlite:///$HOME/.local/share/opencashflow/opencashflow.db" python migrations/0001_wallet_movement_indexes.py
 DATABASE_URL="sqlite:///$HOME/.local/share/opencashflow/opencashflow.db" python migrations/0002_cell_actual_entry_entry_kind.py
+DATABASE_URL="sqlite:///$HOME/.local/share/opencashflow/opencashflow.db" python migrations/0003_period_sort_order_unique.py
 ```
 
 Every script in `migrations/` requires `DATABASE_URL` to be set explicitly (it

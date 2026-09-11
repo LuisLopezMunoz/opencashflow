@@ -4,36 +4,41 @@ Registro de hilos sueltos de DESARROLLO (refactors, deuda técnica de fondo) que
 abiertos en el motor `opencashflow` (core, público), para no depender de la memoria de la
 conversación. Se actualiza a medida que se resuelven o aparecen nuevos.
 
-Los pendientes de la app/CLI (`opencashflow-cli`, a renombrarse a `client`) viven en su
-propio `PENDIENTES.md`, no acá.
+Los pendientes de la app/cliente (`opencashflow-client`, ex `opencashflow-cli`) viven
+en su propio `PENDIENTES.md`, no acá.
 
 ## Abiertos
 
-_(ninguno por ahora)_
-
-## Riesgos documentados (sin acción por ahora)
-
-- **Colisión latente de `sort_order`** entre `periods.extend_periods_backward`
-  y las guardas de orden estricto (`<`/`>`) de `close_period`/`reopen_period`
-  (segunda pasada de auditoría, 2026-09-08). `extend_periods_backward`
-  decrementa su `next_sort_order` en cada iteración del loop, incluso cuando
-  esa iteración se salta por fecha ya existente -- bajo un setup normal
-  (secuencial) nunca colisiona, pero un período insertado manualmente con un
-  `sort_order` fuera de rango podría, en teoría, terminar compartiendo
-  `sort_order` con otro. Ambas guardas de cierre/reapertura dependen de que
-  `sort_order` sea un orden total sin colisiones. No reproducido como
-  problema real; requiere un setup contrivado. Si algún día se quiere cerrar
-  el gap: `UniqueConstraint` en `(sheet_id, sort_order)` (necesitaría
-  migración) o una validación defensiva en el propio loop.
-- **Gap de cobertura de tests preexistente** en las `UniqueConstraint` de
-  `SheetCell` (`uq_cell`) y `SheetPeriod` (`uq_sheet_period`): no hay un test
-  directo de que levanten `IntegrityError` a nivel de DB, a diferencia de
-  `WalletMovement.reverses_movement_id`, que sí lo tiene
-  (`test_reverses_movement_id_is_unique_at_the_db_level`). No introducido por
-  la migración a `Mapped[]` (confirmado vía diff) -- solo una ausencia de
-  test que sería barato agregar en algún momento, mismo patrón.
+- **Correr la migración 0003 contra la base real.** `migrations/0003_period_sort_order_unique.py`
+  está escrita, probada contra una copia descartable de la base real (aplicada limpia,
+  re-corrida para confirmar idempotencia, `opencashflow sheets` funcionando igual
+  después), pero **no aplicada todavía a `~/.local/share/opencashflow/opencashflow.db`**
+  -- ver el resto de este archivo para el detalle. Correr con backup previo, como las
+  migraciones 0001/0002.
 
 ## Resueltos (referencia)
+
+- **Los dos riesgos documentados de la segunda pasada (2026-09-11)**:
+  - **Colisión de `sort_order`**: al ir a corregirlo, un repaso más riguroso mostró que
+    `periods.extend_periods_backward` **no puede** producir esta colisión por sí solo --
+    su pivote (`earliest`) siempre se recalcula como el `sort_order` mínimo REAL de la
+    planilla al momento de la llamada, y todo valor que asigna es estrictamente menor a
+    ese mínimo, así que nunca puede repetir uno ya existente, sin importar qué tan raro
+    sea el dato ya presente (confirmado con un test que efectivamente prueba esto:
+    `test_extend_periods_backward_pivot_always_beats_an_out_of_band_sort_order`). El
+    hallazgo original de la auditoría (una función específica con un bug) no se sostuvo
+    -- pero el problema de fondo que señalaba sí era real: **nada a nivel de base de
+    datos** impedía que ALGÚN OTRO camino (código futuro, una edición manual) violara el
+    invariante. Se cerró ahí en vez de "arreglar" una función que no tenía el bug:
+    `UniqueConstraint("sheet_id", "sort_order", name="uq_period_sort_order")` nueva en
+    `SheetPeriod`, aplicada vía `migrations/0003_period_sort_order_unique.py` (ver
+    MIGRATIONS.md v0.13.0) -- probada contra una copia de la base real, pendiente de
+    correr contra la real (ver "Abiertos").
+  - **Gap de cobertura de tests**: se agregaron los tres tests que faltaban en
+    `test_models.py` -- `uq_sheet_period`, `uq_period_sort_order` (el nuevo) y `uq_cell`
+    levantan `IntegrityError` a nivel de DB, mismo patrón que
+    `test_reverses_movement_id_is_unique_at_the_db_level`.
+  308 tests en verde (4 nuevos), `ruff`/`mypy` limpios.
 
 - **CLI: `period reopen` y `creditcard statement`** (2026-09-11). `reopen_period`
   y la proyección de interés/pago mínimo (ambas ya en el core desde la ronda

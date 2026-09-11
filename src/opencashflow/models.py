@@ -158,7 +158,20 @@ class SheetPeriod(Base):
     """A single time column (month) in the sheet."""
 
     __tablename__ = "sheet_periods"
-    __table_args__ = (UniqueConstraint("sheet_id", "period_date", name="uq_sheet_period"),)
+    __table_args__ = (
+        UniqueConstraint("sheet_id", "period_date", name="uq_sheet_period"),
+        # close_period/reopen_period's ordering guards compare sort_order
+        # with strict </> to decide "earlier"/"later" -- that only means
+        # anything if sort_order is a genuine total order with no ties.
+        # periods.extend_periods_backward can't itself produce a collision
+        # (it always recomputes its pivot as the sheet's true minimum
+        # sort_order and walks strictly below it -- see
+        # test_extend_periods_backward_pivot_always_beats_an_out_of_band_
+        # sort_order), but nothing else in the codebase enforced the
+        # invariant at all before this constraint -- a future write path,
+        # or a direct manual edit, could still violate it silently.
+        UniqueConstraint("sheet_id", "sort_order", name="uq_period_sort_order"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     sheet_id: Mapped[int] = mapped_column(ForeignKey("cashflow_sheets.id"), nullable=False, index=True)
