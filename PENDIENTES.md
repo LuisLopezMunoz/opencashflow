@@ -9,14 +9,16 @@ en su propio `PENDIENTES.md`, no acá.
 
 ## Abiertos
 
-- **Correr la migración 0003 contra la base real.** `migrations/0003_period_sort_order_unique.py`
-  está escrita, probada contra una copia descartable de la base real (aplicada limpia,
-  re-corrida para confirmar idempotencia, `opencashflow sheets` funcionando igual
-  después), pero **no aplicada todavía a `~/.local/share/opencashflow/opencashflow.db`**
-  -- ver el resto de este archivo para el detalle. Correr con backup previo, como las
-  migraciones 0001/0002.
+_(ninguno por ahora)_
 
 ## Resueltos (referencia)
+
+- **Migración 0003 aplicada a la base real** (2026-09-14). Backup
+  `opencashflow.db.backup-2026-09-14-pre-sort-order-migration` primero,
+  luego `migrations/0003_period_sort_order_unique.py` contra
+  `~/.local/share/opencashflow/opencashflow.db`. Verificado: el índice
+  `uq_period_sort_order` quedó creado y `opencashflow sheets` sigue
+  leyendo las 21 periods de la planilla real sin cambios.
 
 - **`creditcard statement` renombrado a `creditcard cycle`** (2026-09-14). El
   comando agregado apenas ayer chocaba de nombre con el propio subcomando

@@ -16,6 +16,10 @@ with the exact DDL and a copy-pasteable SQLite snippet. A runnable script lives 
 
 ## v0.13.0
 
+Applied to the maintainer's own real database on 2026-09-14, after an
+`opencashflow.db.backup-2026-09-14-pre-sort-order-migration` backup. Verified via
+`opencashflow sheets` reading the same periods afterward.
+
 ### `sheet_periods`: new unique index on `(sheet_id, sort_order)`
 
 ```sql
