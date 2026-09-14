@@ -2561,14 +2561,22 @@ def cmd_creditcard_cupo(db, args) -> None:
 
 
 
-def cmd_creditcard_statement(db, args) -> None:
-    """Muestra el estado de cuenta 'instantáneo' de una tarjeta para un mes
-    dado: real si el banco ya reportó el ciclo correspondiente, proyectado
-    si no. Incluye interés y pago mínimo -- real, lo que el banco informó;
-    proyectado, una estimación simple (interés no compuesto sobre el saldo
-    anterior, pago mínimo = tasa x saldo adeudado) marcada explícitamente
-    como no confirmada contra un estado de cuenta real, y como None (no
-    disponible) cuando el saldo anterior mismo no se conoce."""
+def cmd_creditcard_cycle(db, args) -> None:
+    """Muestra el ciclo de facturación 'instantáneo' de una tarjeta para un
+    mes dado: real si el banco ya reportó el ciclo correspondiente,
+    proyectado si no. Incluye interés y pago mínimo -- real, lo que el
+    banco informó; proyectado, una estimación simple (interés no compuesto
+    sobre el saldo anterior, pago mínimo = tasa x saldo adeudado) marcada
+    explícitamente como no confirmada contra un estado de cuenta real, y
+    como None (no disponible) cuando el saldo anterior mismo no se conoce.
+
+    Nombrado 'cycle', no 'statement' -- una app consumidora (ver
+    opencashflow-client) puede tener su propio subcomando `creditcard
+    statement` para manejo real de estados de cuenta con PDF, y
+    `register_generic_commands` comparte el mismo `creditcard_sub` con
+    cualquier extensión de una app consumidora: dos subparsers con el mismo
+    nombre chocan en argparse (`cannot reuse action for name ...`), tirando
+    abajo el CLI completo, no solo este comando."""
     card = _resolve_creditcard_or_exit(db, args.card)
     period_date = _parse_base_period(args.period) if args.period else date.today().replace(day=1)
 
@@ -3524,12 +3532,12 @@ def register_generic_commands(sub) -> GenericCommandExtensionPoints:
     )
     p_cc_cupo.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
 
-    p_cc_statement = creditcard_sub.add_parser(
-        "statement", help="Estado de cuenta instantáneo (real o proyectado): incluye interés y pago mínimo",
+    p_cc_cycle = creditcard_sub.add_parser(
+        "cycle", help="Ciclo de facturación instantáneo (real o proyectado): incluye interés y pago mínimo",
     )
-    p_cc_statement.add_argument("--card", type=str, required=True, help="Nombre (o parte) o id de la tarjeta")
-    p_cc_statement.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (default: el mes actual)")
-    p_cc_statement.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
+    p_cc_cycle.add_argument("--card", type=str, required=True, help="Nombre (o parte) o id de la tarjeta")
+    p_cc_cycle.add_argument("--period", type=str, default=None, help="Mes YYYY-MM (default: el mes actual)")
+    p_cc_cycle.add_argument("--unit", choices=["k", "1"], default="1", help="1 = pesos completos (default), k = miles")
 
     p_cc_edit = creditcard_sub.add_parser("edit", help="Editar una tarjeta existente (actualización parcial)")
     p_cc_edit.add_argument("--card", type=str, required=True, help="Nombre (o parte) o id de la tarjeta")
@@ -3703,8 +3711,8 @@ def main() -> None:
                 cmd_creditcard_edit(db, args)
             elif args.creditcard_command == "cupo":
                 cmd_creditcard_cupo(db, args)
-            elif args.creditcard_command == "statement":
-                cmd_creditcard_statement(db, args)
+            elif args.creditcard_command == "cycle":
+                cmd_creditcard_cycle(db, args)
             elif args.creditcard_command == "map":
                 cmd_creditcard_map(db, args)
     finally:

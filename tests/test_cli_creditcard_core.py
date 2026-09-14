@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from decimal import Decimal
 
 from opencashflow.cli import (
-    cmd_creditcard_cupo, cmd_creditcard_edit, cmd_creditcard_list, cmd_creditcard_map, cmd_creditcard_statement,
+    cmd_creditcard_cupo, cmd_creditcard_edit, cmd_creditcard_list, cmd_creditcard_map, cmd_creditcard_cycle,
 )
 from opencashflow.credit_card import CreditCard, CreditCardStatement, CreditCardStatementLine
 from opencashflow.models import Base, CashflowSheet, SheetPeriod, SheetRow, SheetSection
@@ -205,22 +205,22 @@ def test_cmd_creditcard_cupo_flags_non_active_status(db, card, capsys):
 
 
 # ---------------------------------------------------------------------------
-# cmd_creditcard_statement
+# cmd_creditcard_cycle
 #
 # `card`'s closing_day=25/due_day=28 means due_day > closing_day, so
 # _payment_lag_months(card) == 0 -- the payment period passed via --period
 # equals the billing period directly, no month-shift arithmetic needed here.
 # ---------------------------------------------------------------------------
 
-def test_cmd_creditcard_statement_previous_balance_unknown(db, card, capsys):
-    cmd_creditcard_statement(db, NS(card="Tarjeta CLI", period="2026-01", unit="1"))
+def test_cmd_creditcard_cycle_previous_balance_unknown(db, card, capsys):
+    cmd_creditcard_cycle(db, NS(card="Tarjeta CLI", period="2026-01", unit="1"))
     out = capsys.readouterr().out
     assert "(proyectado)" in out
     assert "desconocido" in out
     assert out.count("no disponible") == 2
 
 
-def test_cmd_creditcard_statement_real(db, card, capsys):
+def test_cmd_creditcard_cycle_real(db, card, capsys):
     stmt = CreditCardStatement(
         credit_card_id=card.id, billing_period=date(2026, 1, 1),
         previous_balance=Decimal("200000"), payments_received=Decimal("200000"),
@@ -238,7 +238,7 @@ def test_cmd_creditcard_statement_real(db, card, capsys):
     ))
     db.commit()
 
-    cmd_creditcard_statement(db, NS(card="Tarjeta CLI", period="2026-01", unit="1"))
+    cmd_creditcard_cycle(db, NS(card="Tarjeta CLI", period="2026-01", unit="1"))
     out = capsys.readouterr().out
     assert "(real)" in out
     assert "Saldo anterior: 200.000" in out
@@ -247,7 +247,7 @@ def test_cmd_creditcard_statement_real(db, card, capsys):
     assert "Compra supermercado" in out
 
 
-def test_cmd_creditcard_statement_projected_with_known_previous_balance(db, card, capsys):
+def test_cmd_creditcard_cycle_projected_with_known_previous_balance(db, card, capsys):
     stmt = CreditCardStatement(
         credit_card_id=card.id, billing_period=date(2026, 1, 1),
         previous_balance=Decimal("0"), payments_received=Decimal("0"),
@@ -259,7 +259,7 @@ def test_cmd_creditcard_statement_projected_with_known_previous_balance(db, card
     db.add(stmt)
     db.commit()
 
-    cmd_creditcard_statement(db, NS(card="Tarjeta CLI", period="2026-02", unit="1"))
+    cmd_creditcard_cycle(db, NS(card="Tarjeta CLI", period="2026-02", unit="1"))
     out = capsys.readouterr().out
     assert "(proyectado)" in out
     assert "Saldo anterior: 100.000" in out
@@ -268,7 +268,7 @@ def test_cmd_creditcard_statement_projected_with_known_previous_balance(db, card
     assert "no confirmada contra un estado de cuenta real" in out
 
 
-def test_cmd_creditcard_statement_card_not_found_exits(db, capsys):
+def test_cmd_creditcard_cycle_card_not_found_exits(db, capsys):
     with pytest.raises(SystemExit):
-        cmd_creditcard_statement(db, NS(card="no existe", period="2026-01", unit="1"))
+        cmd_creditcard_cycle(db, NS(card="no existe", period="2026-01", unit="1"))
     assert "No se encontró" in capsys.readouterr().err

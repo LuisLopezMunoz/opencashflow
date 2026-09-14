@@ -18,6 +18,22 @@ en su propio `PENDIENTES.md`, no acá.
 
 ## Resueltos (referencia)
 
+- **`creditcard statement` renombrado a `creditcard cycle`** (2026-09-14). El
+  comando agregado apenas ayer chocaba de nombre con el propio subcomando
+  `creditcard statement` que `opencashflow-client` ya tenía (manejo real de
+  estados de cuenta con PDF) -- ambos registran un subparser sobre el mismo
+  `creditcard_sub` que `register_generic_commands` comparte con cualquier
+  app consumidora, y `argparse` no permite dos con el mismo nombre
+  (`cannot reuse action for name ...`) -- hubiera tumbado el CLI completo
+  de `client` en cuanto actualizara su pin, no solo ese comando. Se
+  renombró el lado del core (recién agregado, sin publicar todavía) en vez
+  del lado de `client` (ya establecido, con tests propios): función
+  `cmd_creditcard_statement` → `cmd_creditcard_cycle`, subcomando
+  `"statement"` → `"cycle"`. Verificado simulando el registro del propio
+  subparser `"statement"` de `client` sobre el `creditcard_sub` ya
+  construido del core -- ya no choca. 317 tests en verde, `ruff`/`mypy`
+  limpios.
+
 - **Los dos riesgos documentados de la segunda pasada (2026-09-11)**:
   - **Colisión de `sort_order`**: al ir a corregirlo, un repaso más riguroso mostró que
     `periods.extend_periods_backward` **no puede** producir esta colisión por sí solo --
