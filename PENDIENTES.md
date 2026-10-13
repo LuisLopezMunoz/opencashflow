@@ -13,6 +13,34 @@ _(ninguno por ahora)_
 
 ## Resueltos (referencia)
 
+- **Fase 0 del plan de la API HTTP: `record_ops.py` + DTOs en `schemas.py`** (2026-10-12).
+  - **Nuevo `opencashflow.record_ops`** (mismo patrón que `overrides.py`): `set_record`/
+    `clear_record`/`undo_record`/`record_history`. Cierra un gap real: el camino de
+    escritura de `record set` vivía inline dentro de `cmd_record_set` y **nunca llamaba a
+    `guard_periods_not_closed`** -- se podía escribir un valor real sobre un período ya
+    cerrado (test de regresión rojo antes, verde después). `undo_record` ahora levanta
+    `EmptyRecordStackError` (antes capturaba `ValueError` a ciegas y re-levantaba un
+    `ValueError` genérico, perdiendo el tipo). `cli.py` quedó con alias delgados
+    (`_do_record_*`, mismo patrón que `_do_set_override`), sin el `sheet_id` sin uso que
+    recibían undo/clear. `UNSET` es un enum de un solo miembro (tipado limpio para mypy) y
+    se importa en `cli.py` como `_RECORD_UNSET`, explícitamente distinto del `_UNSET` propio
+    de `cli.py`.
+  - **`cmd_override_set`/`cmd_override_clear` y los 3 llamados del wizard** no capturaban
+    el `ValueError` del guard de período cerrado agregado en la segunda pasada -- mostraban
+    un traceback crudo (y en el wizard, tumbaban la sesión interactiva). Ahora mensaje
+    limpio + exit(1) en los comandos, mensaje + volver al menú en el wizard (rojo verificado
+    contra el código anterior en un worktree descartable).
+  - **`schemas.py`**: `PeriodOutSimple` colapsado en `PeriodOut` (idénticos);
+    `CellActualOut` eliminado (sin consumidores, reemplazado por `RecordSetResultOut`);
+    `CellComputedOut` con `from_attributes=True` (valida directo sobre `engine.CellResult`);
+    DTOs nuevos para Wallet/WalletMovement, CreditCard/Charge/Statement/Line,
+    `InstantStatement`, `SyncReport`, los reportes de cierre/reapertura y los resultados de
+    `overrides`/`record_ops` -- cada uno probado con `model_validate` sobre el valor REAL que
+    devuelve la función del core que espeja. `CreditCardOut` omite `current_balance`
+    (deprecado); `CreditCardCreate.last4` exige exactamente 4 dígitos en el borde.
+  342 tests en verde, `ruff`/`mypy` limpios (16 fuentes). Suite de `opencashflow-client`
+  (194 passed) verificada contra este core local -- compatible.
+
 - **Migración 0003 aplicada a la base real** (2026-09-14). Backup
   `opencashflow.db.backup-2026-09-14-pre-sort-order-migration` primero,
   luego `migrations/0003_period_sort_order_unique.py` contra

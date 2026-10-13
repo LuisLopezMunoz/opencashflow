@@ -97,9 +97,7 @@ def extend_periods_backward(sheet: CashflowSheet, months: int, db: Session) -> L
 def is_same_month(a: datetime, b: datetime) -> bool:
     """True when `a` and `b` fall in the same calendar month/year -- the one
     comparison every "is this period the current one" check in this package
-    actually needs, previously reimplemented independently in three places
-    (this function's own former inline version, schemas.PeriodOut, and
-    schemas.PeriodOutSimple)."""
+    actually needs (find_anchor_period below, schemas.PeriodOut)."""
     return a.year == b.year and a.month == b.month
 
 
