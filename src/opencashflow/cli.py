@@ -46,12 +46,9 @@ from sqlalchemy.orm import sessionmaker
 from opencashflow import __version__
 from opencashflow.cli_export import export_csv, export_xlsx
 from opencashflow.credit_card import CreditCard
-from opencashflow.creditcard_statements import (
-    _cupo_disponible_detail,
-    _cupo_disponible_real_ahora,
-    compute_instant_statement,
-    resolve_credit_card,
-)
+from opencashflow.creditcard_ops import edit_card as _do_edit_card
+from opencashflow.creditcard_ops import map_card
+from opencashflow.creditcard_statements import compute_instant_statement, cupo_report, resolve_credit_card
 from opencashflow.engine import (
     build_sum_rows_hierarchy as _build_sum_rows_hierarchy,
     compute_sheet,
@@ -92,6 +89,7 @@ from opencashflow.sheet_spec import (
     serialize_sheet_spec,
 )
 from opencashflow.wallet import Wallet, WalletMovement
+from opencashflow.wallet_ops import edit_wallet as _do_edit_wallet
 from opencashflow.wallet_movements import do_wallet_movement_add, do_wallet_movement_undo
 
 
@@ -1141,11 +1139,9 @@ def cmd_row_add(db, args) -> None:
     print("Nota: --sign solo importa si esta fila es referenciada dentro del sum_rows de otra fila.")
 
 
-# Sentinel distinguishing "this field wasn't passed at all, don't touch it"
-# from a real value -- for _do_edit_wallet/_do_edit_card below and the
-# wizard's own "no cambiar" answers. (_do_edit_row has its own,
-# opencashflow.structure.UNSET; nothing passes this one to it -- callers
-# only pass the fields that change.)
+# The wizard's own "no cambiar" answer -- never passed on to a write
+# function (_do_edit_row/_do_edit_wallet/_do_edit_card use
+# opencashflow.unset.UNSET; callers here only pass the fields that change).
 _UNSET = object()
 
 
@@ -1249,8 +1245,8 @@ def cmd_record_set(db, args) -> None:
         sys.exit(1)
 
     # argparse can only express "omitted" (None), never "clear this one
-    # field" -- so None always maps to record_ops' own UNSET sentinel here
-    # (NOT this module's unrelated _UNSET, used by the _do_edit_* helpers).
+    # field" -- so None always maps to record_ops' UNSET sentinel here
+    # (NOT this module's unrelated _UNSET, the wizard's "no cambiar").
     def _field(raw):
         return _RECORD_UNSET if raw is None else Decimal(str(raw))
 
@@ -2030,27 +2026,8 @@ def cmd_wallet_list(db, args) -> None:
 
 
 
-def _do_edit_wallet(
-    db, wallet: Wallet, *, name=_UNSET, wallet_type=_UNSET, currency=_UNSET, balance=_UNSET, description=_UNSET,
-) -> Dict[str, Tuple]:
-    """Partial update, same _UNSET-sentinel/only-report-actual-changes
-    pattern as _do_edit_card/_do_edit_row."""
-    fields = {"name": name, "wallet_type": wallet_type, "currency": currency, "balance": balance,
-              "description": description}
-    changes: Dict[str, Tuple] = {}
-    for field_name, value in fields.items():
-        if value is _UNSET:
-            continue
-        old = getattr(wallet, field_name)
-        if value != old:
-            changes[field_name] = (old, value)
-            setattr(wallet, field_name, value)
-    if changes:
-        db.commit()
-        db.refresh(wallet)
-    return changes
-
-
+# _do_edit_wallet now lives in opencashflow.wallet_ops (imported above
+# under its old name).
 
 
 def cmd_wallet_edit(db, args) -> None:
@@ -2068,7 +2045,11 @@ def cmd_wallet_edit(db, args) -> None:
     if args.description is not None:
         kwargs["description"] = args.description
 
-    changes = _do_edit_wallet(db, wallet, **kwargs)
+    try:
+        changes = _do_edit_wallet(db, wallet, **kwargs)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
     if not changes:
         print(f"Billetera [{wallet.id}] '{wallet.name}': no se pasó ningún cambio.")
         return
@@ -2253,35 +2234,8 @@ def cmd_creditcard_list(db, args) -> None:
         )
 
 
-def _do_edit_card(
-    db, card: CreditCard, *,
-    name=_UNSET, bank=_UNSET, credit_limit=_UNSET, closing_day=_UNSET, due_day=_UNSET,
-    interest_rate=_UNSET, minimum_payment_rate=_UNSET, currency=_UNSET,
-    last4=_UNSET, expiration_date=_UNSET, network=_UNSET, holder_name=_UNSET, status=_UNSET,
-) -> Dict[str, Tuple]:
-    """Partial update of `card`: only fields actually passed (not left at
-    the _UNSET default -- the same sentinel _do_edit_row uses) are
-    considered, and only ones that actually change something are applied --
-    same pattern as _do_edit_row. Commits only if something actually
-    changed."""
-    fields = {
-        "name": name, "bank": bank, "credit_limit": credit_limit, "closing_day": closing_day, "due_day": due_day,
-        "interest_rate": interest_rate, "minimum_payment_rate": minimum_payment_rate, "currency": currency,
-        "last4": last4, "expiration_date": expiration_date, "network": network, "holder_name": holder_name,
-        "status": status,
-    }
-    changes: Dict[str, Tuple] = {}
-    for field_name, value in fields.items():
-        if value is _UNSET:
-            continue
-        old = getattr(card, field_name)
-        if value != old:
-            changes[field_name] = (old, value)
-            setattr(card, field_name, value)
-    if changes:
-        db.commit()
-        db.refresh(card)
-    return changes
+# _do_edit_card now lives in opencashflow.creditcard_ops (imported above
+# under its old name).
 
 
 def cmd_creditcard_edit(db, args) -> None:
@@ -2315,7 +2269,11 @@ def cmd_creditcard_edit(db, args) -> None:
     if args.status is not None:
         kwargs["status"] = args.status
 
-    changes = _do_edit_card(db, card, **kwargs)
+    try:
+        changes = _do_edit_card(db, card, **kwargs)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
     if not changes:
         print(f"Sin cambios para la tarjeta '{card.name}' [{card.id}].")
         return
@@ -2329,14 +2287,12 @@ def cmd_creditcard_map(db, args) -> None:
     sheet = _pick_sheet(db, args.sheet_id)
     row = _resolve_row(db, sheet.id, args.row)
 
+    old_sheet_id, old_row_id = map_card(db, card, sheet, row)
     old_mapping = (
-        f"planilla #{card.mapped_sheet_id} / fila #{card.mapped_row_id}"
-        if card.mapped_sheet_id is not None and card.mapped_row_id is not None
+        f"planilla #{old_sheet_id} / fila #{old_row_id}"
+        if old_sheet_id is not None and old_row_id is not None
         else "(sin mapear)"
     )
-    card.mapped_sheet_id = sheet.id
-    card.mapped_row_id = row.id
-    db.commit()
 
     print(
         f"[OK] Tarjeta '{card.name}' [{card.id}] mapeada a planilla #{sheet.id} ('{sheet.name}') / "
@@ -2375,11 +2331,12 @@ def cmd_creditcard_cupo(db, args) -> None:
 
     for card in cards:
         try:
-            real_now, real_is_estimate = _cupo_disponible_real_ahora(db, card, today)
-            plan_cupo, plan_is_estimate = _cupo_disponible_detail(db, card, today)
+            cupo = cupo_report(db, card, today)
         except ValueError as e:
             print(f"[{card.name}] {e}", file=sys.stderr)
             continue
+        real_now, real_is_estimate = cupo.real_now, cupo.real_now_is_estimate
+        plan_cupo, plan_is_estimate = cupo.planning, cupo.planning_is_estimate
         real_tag = " (estimado)" if real_is_estimate else ""
         plan_tag = " (estimado)" if plan_is_estimate else ""
         estado = f"  [estado={card.status} -- no usable para gastos nuevos]" if card.status != "active" else ""

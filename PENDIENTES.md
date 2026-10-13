@@ -15,6 +15,34 @@ en su propio `PENDIENTES.md`, no acá.
 
 ## Resueltos (referencia)
 
+- **Billeteras y tarjetas pasan al core público, para la Fase 2.2 de la API HTTP**
+  (2026-10-13, publicado como v0.16.0; decisión explícita de Luis: lo genérico va al core,
+  el import de PDF y el bridge siguen privados).
+  - **Nuevo `opencashflow.wallet_ops`**: `create_wallet` (antes inline en el `wallet add` del
+    client) y `edit_wallet` (antes `cli._do_edit_wallet`, que queda como alias).
+  - **Nuevo `opencashflow.creditcard_ops`**: `create_card`, `edit_card` (alias
+    `cli._do_edit_card`), `map_card`, `add_charge`, `create_statement`, `upsert_statement`,
+    `add_statement_line` -- antes repartidos entre `cli.py` y comandos del client que
+    validaban inline. Validaciones que ahora aplican a toda superficie: día de cierre/pago
+    en 1..31 (también al editar, antes solo al crear), **`last4` exactamente 4 dígitos (el
+    `--last4` del CLI aceptaba un número de tarjeta completo)**, estado válido, tarjeta no
+    activa sin cargos nuevos, cuotas N/M coherentes, cargo de la misma tarjeta, sin línea
+    duplicada por cuota. `edit_card` valida todo antes de tocar la tarjeta.
+  - **`add_charge` ya no suma al `current_balance` deprecado** (nada lo lee); el bridge
+    financing del client todavía lo escribe.
+  - **`creditcard_statements.cupo_report`**: las dos cifras de cupo ("real ahora" y "para
+    planificar") en un solo resultado; lo usan `ocf creditcard cupo` (core y client) y la API.
+  - **Gap cerrado: `sync_period` no respetaba un período cerrado** -- escribía el
+    `accrued_value` (estado real) o un override (proyección) sobre la celda congelada.
+    Ahora `guard_periods_not_closed` también ahí (dentro de `_sync_period_write`, así que
+    el bridge del client lo hereda), incluido el `dry_run`. Rojo antes, verde después.
+  - **`opencashflow.unset`**: un solo centinela `UNSET` para todas las escrituras parciales
+    (record_ops, structure, wallet_ops, creditcard_ops).
+  - **`schemas.py`**: `WalletUpdate`/`CreditCardUpdate` rechazan `null` en columnas
+    obligatorias; `CreditCardStatementCreate` pierde `currency` (siempre la de la tarjeta);
+    nuevos `WalletMovementCreate`, `WalletMovementUndoRequest`, `CreditCardMapRequest`,
+    `CreditCardSyncRequest`, `CupoReportOut`.
+
 - **`structure.py` + validación de reglas, para la Fase 2.1 de la API HTTP** (2026-10-13,
   publicado como v0.15.0).
   - **Nuevo `opencashflow.structure`**: `add_section`/`add_row`/`edit_row` salen de `cli.py`

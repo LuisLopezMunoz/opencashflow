@@ -90,6 +90,14 @@ class RowCreate(BaseModel):
     notes: Optional[str] = None
 
 
+def _reject_explicit_nulls(model: BaseModel, not_null: tuple) -> None:
+    """For a partial-update body: a field explicitly sent as null means
+    "clear it" -- refused for the columns that can't be null."""
+    nulled = [f for f in not_null if f in model.model_fields_set and getattr(model, f) is None]
+    if nulled:
+        raise ValueError(f"These fields can't be null: {', '.join(nulled)}.")
+
+
 _ROW_COLUMNS_NOT_NULL = ("name", "row_type", "sort_order", "is_visible", "sign")
 
 
@@ -109,9 +117,7 @@ class RowUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _no_null_for_required_columns(self) -> "RowUpdate":
-        nulled = [f for f in _ROW_COLUMNS_NOT_NULL if f in self.model_fields_set and getattr(self, f) is None]
-        if nulled:
-            raise ValueError(f"These fields can't be null: {', '.join(nulled)}.")
+        _reject_explicit_nulls(self, _ROW_COLUMNS_NOT_NULL)
         return self
 
 
@@ -482,13 +488,19 @@ class WalletCreate(BaseModel):
 
 class WalletUpdate(BaseModel):
     """Partial update -- only fields present in the request are applied
-    (use model_fields_set to tell "omitted" apart from "explicitly null")."""
+    (use model_fields_set to tell "omitted" apart from "explicitly null");
+    null clears `description`, and is refused for every other field."""
 
     name: Optional[str] = None
     wallet_type: Optional[str] = None
     currency: Optional[str] = None
     balance: Optional[Decimal] = None
     description: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _no_null_for_required_columns(self) -> "WalletUpdate":
+        _reject_explicit_nulls(self, ("name", "wallet_type", "currency", "balance"))
+        return self
 
 
 class WalletOut(BaseModel):
@@ -518,6 +530,23 @@ class WalletMovementOut(BaseModel):
     created_at: Optional[datetime]
 
     model_config = {"from_attributes": True}
+
+
+class WalletMovementCreate(BaseModel):
+    """Request body for POST /wallets/{id}/movements -- a real cash event on
+    one sheet cell. `amount` is always positive: the row's own direction
+    decides whether the wallet grows or shrinks (see
+    opencashflow.wallet_movements)."""
+
+    sheet_id: int
+    row_id: int
+    period_id: int
+    amount: Decimal = Field(gt=0)
+    note: Optional[str] = None
+
+
+class WalletMovementUndoRequest(BaseModel):
+    note: Optional[str] = None
 
 
 class WalletMovementResultOut(BaseModel):
@@ -562,7 +591,8 @@ class CreditCardCreate(BaseModel):
 
 
 class CreditCardUpdate(BaseModel):
-    """Partial update -- see WalletUpdate."""
+    """Partial update -- see WalletUpdate. Null is refused for the columns
+    that can't be null."""
 
     name: Optional[str] = None
     bank: Optional[str] = None
@@ -577,6 +607,45 @@ class CreditCardUpdate(BaseModel):
     network: Optional[str] = None
     holder_name: Optional[str] = None
     status: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _no_null_for_required_columns(self) -> "CreditCardUpdate":
+        _reject_explicit_nulls(
+            self, ("name", "credit_limit", "currency", "interest_rate", "minimum_payment_rate", "status"),
+        )
+        return self
+
+
+class CreditCardMapRequest(BaseModel):
+    """Request body for PUT /credit-cards/{id}/mapping -- the sheet row the
+    card's monthly bill lands on (creditcard_ops.map_card)."""
+
+    sheet_id: int
+    row_id: int
+
+
+class CreditCardSyncRequest(BaseModel):
+    """Request body for POST /credit-cards/{id}/sync -- the
+    creditcard_statements.sync_period arguments. sheet_id/row_id override
+    the card's own mapping for this one call; `period` is the sheet's
+    (payment) month."""
+
+    period: date
+    sheet_id: Optional[int] = None
+    row_id: Optional[int] = None
+    dry_run: bool = False
+
+
+class CupoReportOut(BaseModel):
+    """creditcard_statements.CupoReport -- two figures, never merged: see
+    that dataclass."""
+
+    real_now: Decimal
+    real_now_is_estimate: bool
+    planning: Decimal
+    planning_is_estimate: bool
+
+    model_config = {"from_attributes": True}
 
 
 class CreditCardOut(BaseModel):
@@ -658,6 +727,11 @@ class CreditCardStatementLineOut(BaseModel):
 
 
 class CreditCardStatementCreate(BaseModel):
+    """Request body for recording a real statement by hand
+    (creditcard_ops.upsert_statement): creates it, or updates the one
+    already recorded for that card and cycle -- only the optional amounts
+    actually sent. Always in the card's own currency."""
+
     billing_period: date
     closing_date: date
     due_date: date
@@ -670,7 +744,6 @@ class CreditCardStatementCreate(BaseModel):
     other_charges: Optional[Decimal] = None
     minimum_payment: Optional[Decimal] = None
     remaining_principal_installments: Optional[Decimal] = None
-    currency: str = "USD"
     notes: Optional[str] = None
 
 

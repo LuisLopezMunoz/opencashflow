@@ -22,8 +22,13 @@ from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from opencashflow.credit_card import CreditCard, CreditCardCharge, CreditCardStatement, CreditCardStatementLine
-from opencashflow.creditcard_statements import compute_instant_statement, sync_period
+from opencashflow.credit_card import (
+    CreditCard,
+    CreditCardCharge,
+    CreditCardStatement,
+    CreditCardStatementLine,
+)
+from opencashflow.creditcard_statements import compute_instant_statement, cupo_report, sync_period
 from opencashflow.engine import CellResult
 from opencashflow.models import (
     Base,
@@ -47,7 +52,10 @@ from opencashflow.schemas import (
     CreditCardChargeOut,
     CreditCardCreate,
     CreditCardOut,
+    CreditCardStatementCreate,
     CreditCardStatementOut,
+    CreditCardUpdate,
+    CupoReportOut,
     InstantStatementOut,
     MatrixOut,
     MatrixRowOut,
@@ -76,9 +84,11 @@ from opencashflow.schemas import (
     SheetOut,
     SyncReportOut,
     WalletCreate,
+    WalletMovementCreate,
     WalletMovementResultOut,
     WalletMovementUndoResultOut,
     WalletOut,
+    WalletUpdate,
 )
 from opencashflow.seed import seed_sheet
 from opencashflow.wallet import Wallet
@@ -471,3 +481,37 @@ def test_period_close_and_reopen_requests_default_to_a_real_run():
     close = PeriodCloseRequest()
     assert (close.balance_row_id, close.assume_unrecorded_as_pending, close.dry_run) == (None, False, False)
     assert PeriodReopenRequest().dry_run is False
+
+
+def test_wallet_and_card_updates_refuse_null_for_required_columns():
+    assert WalletUpdate.model_validate({"description": None}).model_fields_set == {"description"}
+    for field in ("name", "wallet_type", "currency", "balance"):
+        with pytest.raises(ValidationError, match=field):
+            WalletUpdate.model_validate({field: None})
+    assert CreditCardUpdate.model_validate({"bank": None, "closing_day": None}).bank is None
+    for field in ("name", "credit_limit", "currency", "interest_rate", "minimum_payment_rate", "status"):
+        with pytest.raises(ValidationError, match=field):
+            CreditCardUpdate.model_validate({field: None})
+
+
+def test_wallet_movement_create_needs_a_positive_amount():
+    body = {"sheet_id": 1, "row_id": 2, "period_id": 3}
+    assert WalletMovementCreate(**body, amount=Decimal("10")).amount == Decimal("10")
+    for bad in ("0", "-5"):
+        with pytest.raises(ValidationError):
+            WalletMovementCreate(**body, amount=Decimal(bad))
+
+
+def test_statement_create_has_no_currency_of_its_own():
+    # Always the card's currency (creditcard_ops.upsert_statement).
+    assert "currency" not in CreditCardStatementCreate.model_fields
+
+
+def test_cupo_report_out_validates_against_a_real_cupo_report(db):
+    card = CreditCard(user_id=TEST_USER_ID, name="Visa", credit_limit=Decimal("1000000"), currency="CLP",
+                      closing_day=25, due_day=5)
+    db.add(card)
+    db.commit()
+    out = CupoReportOut.model_validate(cupo_report(db, card, date(2026, 1, 10)))
+    assert (out.real_now, out.planning) == (Decimal("1000000"), Decimal("1000000"))
+    assert out.real_now_is_estimate is True

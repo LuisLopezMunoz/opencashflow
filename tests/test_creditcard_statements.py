@@ -41,6 +41,7 @@ from opencashflow.creditcard_statements import (
     _cupo_disponible_real_ahora,
     compute_instant_statement,
     cupo_disponible,
+    cupo_report,
     installment_schedule,
     resolve_credit_card,
     sync_period,
@@ -705,3 +706,43 @@ def test_cupo_disponible_real_ahora_excludes_tagged_category(db, card):
 
     assert real_cupo_excluded == Decimal("5000000") - Decimal("100000")
     assert real_cupo_included == Decimal("5000000") - Decimal("400000")
+
+
+def test_cupo_report_carries_both_figures_without_merging_them(db, card, sheet, row):
+    card.mapped_sheet_id = sheet.id
+    card.mapped_row_id = row.id
+    db.commit()
+    _add_statement(
+        db, card, date(2025, 12, 1), new_balance=1_000_000, total_payment_due=200_000,
+        remaining_principal_installments=1_500_000,
+    )
+    report = cupo_report(db, card, date(2026, 1, 10))
+    # Real now still counts the unpaid 200k bill; planning assumes it paid.
+    assert (report.real_now, report.real_now_is_estimate) == (Decimal("3300000"), False)
+    assert (report.planning, report.planning_is_estimate) == (Decimal("3500000"), False)
+
+
+def test_cupo_report_passes_exclude_category_to_the_real_figure_only(db, card):
+    _add_charge(db, card, amount=300_000, installments=1, first_statement_period=date(2026, 1, 1),
+                category="Financiamiento puente")
+    report = cupo_report(db, card, date(2026, 1, 10), exclude_category="Financiamiento puente")
+    assert report.real_now == Decimal("5000000")
+    assert report.planning == Decimal("5000000") - Decimal("300000")
+
+
+@pytest.mark.parametrize("with_statement", [True, False], ids=["branch_a_real", "branch_b_projection"])
+def test_sync_period_refuses_a_closed_period_and_writes_nothing(db, card, sheet, row, with_statement):
+    # Same guard record set/override set/close already apply: a closed
+    # period's cells are frozen -- reopen it first.
+    period_row = _period(db, sheet, 2026, 1)
+    period_row.is_closed = True
+    db.commit()
+    if with_statement:
+        _add_statement(db, card, date(2026, 1, 1), new_balance=180_000, total_payment_due=145_670)
+    else:
+        _add_charge(db, card, amount=50_000, installments=1, first_statement_period=date(2026, 1, 1))
+
+    for dry_run in (True, False):
+        with pytest.raises(ValueError, match="closed"):
+            sync_period(db, card, sheet, row, date(2026, 1, 1), TEST_USER_ID, dry_run=dry_run)
+    assert _cell(db, row.id, period_row.id) is None

@@ -14,26 +14,26 @@ could be silently written onto a period close_period had already frozen.
 Same class of gap opencashflow.overrides was extracted to close.
 """
 import dataclasses
-import enum
 from decimal import Decimal
 from typing import List, Optional, Tuple, Union
 
 from opencashflow.models import CellActualEntry, SheetCell, SheetPeriod, SheetRow, get_or_create_cell
 from opencashflow.record_stack import EmptyRecordStackError, guard_periods_not_closed, pop_record_stack
+from opencashflow.unset import UNSET, Unset
 
 RealValues = Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]
 
+# UNSET (re-exported from opencashflow.unset): "this field was not provided
+# -- leave it untouched". An explicit None is a legitimate value meaning
+# "clear this one field" (actual_value/accrued_value/paid_value are all
+# Optional[Decimal]).
+FieldValue = Union[Optional[Decimal], Unset]
 
-class _Unset(enum.Enum):
-    TOKEN = 0
-
-
-# "This field was not provided -- leave it untouched." Distinct from an
-# explicit None, which is a legitimate value meaning "clear this one field"
-# (actual_value/accrued_value/paid_value are all Optional[Decimal]).
-UNSET = _Unset.TOKEN
-
-FieldValue = Union[Optional[Decimal], _Unset]
+__all__ = [
+    "UNSET", "FieldValue", "RealValues",
+    "RecordSetResult", "RecordHistoryEntry", "RecordUndoResult", "RecordClearResult",
+    "set_record", "record_history", "undo_record", "clear_record",
+]
 
 
 def _period_label(period: SheetPeriod) -> str:

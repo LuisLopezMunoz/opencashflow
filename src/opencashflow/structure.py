@@ -19,20 +19,16 @@ AttributeError out of compute_sheet, taking the whole sheet down. An
 unknown rule TYPE is deliberately still allowed: the engine reports it per
 cell as unsupported_rule:<type>, visibly, by design.
 """
-import enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from opencashflow.enums import ROW_SIGNS, ROW_TYPES
 from opencashflow.models import CashflowSheet, SheetRow, SheetSection
+from opencashflow.unset import UNSET, Unset
 
-
-class _Unset(enum.Enum):
-    TOKEN = 0
-
-
-# "This field was not provided -- leave it untouched." Distinct from an
-# explicit None, which for rule/ledger_mapping/notes means "clear it".
-UNSET = _Unset.TOKEN
+# UNSET (re-exported from opencashflow.unset): "this field was not provided
+# -- leave it untouched". An explicit None for rule/ledger_mapping/notes
+# means "clear it".
+__all__ = ["UNSET", "rule_row_refs", "validate_rule", "add_section", "add_row", "edit_row"]
 
 
 def rule_row_refs(rule: Any) -> List[Any]:
@@ -135,14 +131,14 @@ def add_row(
 
 def edit_row(
     db, row: SheetRow, *,
-    name: Union[str, _Unset] = UNSET,
-    row_type: Union[str, _Unset] = UNSET,
-    sign: Union[str, _Unset] = UNSET,
-    rule: Union[Optional[Dict[str, Any]], _Unset] = UNSET,
-    sort_order: Union[int, _Unset] = UNSET,
-    is_visible: Union[bool, _Unset] = UNSET,
-    ledger_mapping: Union[Optional[Dict[str, Any]], _Unset] = UNSET,
-    notes: Union[Optional[str], _Unset] = UNSET,
+    name: Union[str, Unset] = UNSET,
+    row_type: Union[str, Unset] = UNSET,
+    sign: Union[str, Unset] = UNSET,
+    rule: Union[Optional[Dict[str, Any]], Unset] = UNSET,
+    sort_order: Union[int, Unset] = UNSET,
+    is_visible: Union[bool, Unset] = UNSET,
+    ledger_mapping: Union[Optional[Dict[str, Any]], Unset] = UNSET,
+    notes: Union[Optional[str], Unset] = UNSET,
 ) -> Dict[str, Tuple[Any, Any]]:
     """Partial update of `row`: only fields actually passed (not left at
     UNSET) are considered, and only ones that actually change something are
@@ -156,11 +152,11 @@ def edit_row(
     the "rule" key is for default_projection_rule -- so the caller can
     print an exact "antes -> después" summary without re-deriving it.
     """
-    if not isinstance(row_type, _Unset) and row_type not in ROW_TYPES:
+    if not isinstance(row_type, Unset) and row_type not in ROW_TYPES:
         raise ValueError(f"row_type debe ser uno de {ROW_TYPES}, se recibió {row_type!r}")
-    if not isinstance(sign, _Unset) and sign not in ROW_SIGNS:
+    if not isinstance(sign, Unset) and sign not in ROW_SIGNS:
         raise ValueError(f"sign debe ser uno de {ROW_SIGNS}, se recibió {sign!r}")
-    if not isinstance(rule, _Unset):
+    if not isinstance(rule, Unset):
         validate_rule(db, row.section.sheet_id, rule)
 
     requested: Dict[str, Tuple[str, Any]] = {
@@ -175,7 +171,7 @@ def edit_row(
     }
     changes: Dict[str, Tuple[Any, Any]] = {}
     for field, (attr, new) in requested.items():
-        if isinstance(new, _Unset):
+        if isinstance(new, Unset):
             continue
         old = getattr(row, attr)
         if new != old:

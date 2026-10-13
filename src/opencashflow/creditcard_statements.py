@@ -42,6 +42,7 @@ from opencashflow.models import (
     get_or_create_cell,
     supersede_and_write_override,
 )
+from opencashflow.record_stack import guard_periods_not_closed
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +558,36 @@ def _cupo_disponible_real_ahora(
     return Decimal(str(card.credit_limit)) - pre_existing - unpaid_last_bill - new_real_charges, True
 
 
+@dataclasses.dataclass
+class CupoReport:
+    """The two available-credit figures, deliberately never merged into one:
+    `real_now` is what the bank shows today (an unpaid just-closed bill
+    still occupies room -- it can legitimately be negative), `planning`
+    assumes every closed cycle is already paid, so the same room is never
+    offered twice to a plan. Each `*_is_estimate` is True when the bank's
+    own SALDO CAPITAL CUOTAS wasn't available and installments were
+    estimated instead."""
+
+    real_now: Decimal
+    real_now_is_estimate: bool
+    planning: Decimal
+    planning_is_estimate: bool
+
+
+def cupo_report(
+    db: Session, card: CreditCard, today: date, *, exclude_category: Optional[str] = None,
+) -> CupoReport:
+    """Both figures for `card` as of `today` -- see CupoReport, and
+    _cupo_disponible_real_ahora for `exclude_category` (a consuming app's
+    own planned-not-yet-real charges, kept out of today's real figure)."""
+    real_now, real_is_estimate = _cupo_disponible_real_ahora(db, card, today, exclude_category=exclude_category)
+    planning, planning_is_estimate = _cupo_disponible_detail(db, card, today)
+    return CupoReport(
+        real_now=real_now, real_now_is_estimate=real_is_estimate,
+        planning=planning, planning_is_estimate=planning_is_estimate,
+    )
+
+
 # ---------------------------------------------------------------------------
 # sync_period
 # ---------------------------------------------------------------------------
@@ -699,6 +730,10 @@ def _sync_period_write(
     """
     period_norm = date(period.year, period.month, 1)
     sheet_obj, row_obj, sheet_period = _resolve_sync_target(db, card, sheet, row, period_norm)
+    # Both branches write onto the cell (accrued_value, or an override) --
+    # refused on a closed period like every other cell write. Checked even
+    # for a dry run, so the preview predicts the real outcome.
+    guard_periods_not_closed([sheet_period], "sincronizar una tarjeta")
 
     period_label = period_norm.strftime("%Y-%m")
     lag = _payment_lag_months(card)

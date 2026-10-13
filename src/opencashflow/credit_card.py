@@ -51,8 +51,10 @@ class CreditCard(Base):
     # DEPRECATED: the old bookkeeping counter the statement-tracking feature
     # (creditcard_statements.py) supersedes. Never read by any computation in
     # this package -- cupo_disponible()/compute_instant_statement() derive
-    # available credit from CreditCardCharge/CreditCardStatement instead. Set
-    # only to its 0.0 default by every caller; kept for backward
+    # available credit from CreditCardCharge/CreditCardStatement instead.
+    # Nothing in this package writes it beyond its 0 default (since v0.16.0,
+    # creditcard_ops.add_charge no longer adds each charge to it, as the
+    # consuming app's own `charge add` used to); kept for backward
     # compatibility with any consumer still reading it directly, not because
     # anything here still relies on it.
     current_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=0)
