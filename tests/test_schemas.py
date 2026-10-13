@@ -54,9 +54,12 @@ from opencashflow.schemas import (
     MatrixSectionOut,
     OverrideClearResultOut,
     OverrideWriteResultOut,
+    PeriodCloseRequest,
     PeriodOut,
+    PeriodReopenRequest,
     PeriodsBackfillCreate,
     RealValuesOut,
+    RecordClearRequest,
     RecordClearResultOut,
     RecordHistoryEntryOut,
     RecordSetResultOut,
@@ -439,3 +442,32 @@ def test_credit_card_charge_create_rejects_zero_installments():
 def test_wallet_create_accepts_minimal_input():
     wallet = WalletCreate(name="Efectivo")
     assert (wallet.wallet_type, wallet.balance) == ("cash", Decimal("0"))
+
+
+# ---------------------------------------------------------------------------
+# Section/row input defaults, RowUpdate's null guard, action request bodies
+# ---------------------------------------------------------------------------
+
+def test_section_and_row_create_default_to_appending_not_to_position_zero():
+    assert SectionCreate(name="Gastos").sort_order is None
+    assert RowCreate(name="Arriendo").sort_order is None
+
+
+def test_row_update_allows_clearing_nullable_fields_but_not_required_ones():
+    cleared = RowUpdate.model_validate({"default_projection_rule": None, "notes": None})
+    assert cleared.model_fields_set == {"default_projection_rule", "notes"}
+    for field in ("name", "row_type", "sort_order", "is_visible", "sign"):
+        with pytest.raises(ValidationError, match=field):
+            RowUpdate.model_validate({field: None})
+
+
+def test_record_clear_request_needs_at_least_one_period():
+    assert RecordClearRequest(period_ids=[1, 2]).period_ids == [1, 2]
+    with pytest.raises(ValidationError):
+        RecordClearRequest(period_ids=[])
+
+
+def test_period_close_and_reopen_requests_default_to_a_real_run():
+    close = PeriodCloseRequest()
+    assert (close.balance_row_id, close.assume_unrecorded_as_pending, close.dry_run) == (None, False, False)
+    assert PeriodReopenRequest().dry_run is False

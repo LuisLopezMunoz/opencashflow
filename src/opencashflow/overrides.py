@@ -27,6 +27,7 @@ from opencashflow.models import (
     supersede_and_write_override,
 )
 from opencashflow.record_stack import guard_periods_not_closed
+from opencashflow.structure import validate_rule
 
 
 @dataclasses.dataclass
@@ -65,11 +66,15 @@ def set_override(
     value=None.
 
     Refuses (ValueError, via guard_periods_not_closed) to touch any period
-    in `periods` that is_closed, before writing anything. Commits once at
-    the end. Every write supersedes any existing active override on that
-    cell first (see models.supersede_and_write_override).
+    in `periods` that is_closed, or (via structure.validate_rule) to store
+    a `rule` that references rows outside the sheet or would crash the
+    engine -- both before writing anything. Commits once at the end. Every
+    write supersedes any existing active override on that cell first (see
+    models.supersede_and_write_override).
     """
     guard_periods_not_closed(periods, "escribir un override")
+    if not lock and rule is not None:
+        validate_rule(db, sheet_id, rule)
 
     captured_by_period: Dict[int, Optional[Decimal]] = {}
     if lock:

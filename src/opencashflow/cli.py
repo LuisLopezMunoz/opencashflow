@@ -80,6 +80,10 @@ from opencashflow.record_ops import record_history as _do_record_history
 from opencashflow.record_ops import set_record as _do_record_set
 from opencashflow.record_ops import undo_record as _do_record_undo
 from opencashflow.seed import seed_sheet
+from opencashflow.structure import add_row as _do_add_row
+from opencashflow.structure import add_section as _do_add_section
+from opencashflow.structure import edit_row as _do_edit_row
+from opencashflow.structure import rule_row_refs
 from opencashflow.sheet_spec import (
     export_sheet_spec,
     format_from_extension,
@@ -851,18 +855,9 @@ def _diagnose(result) -> list:
     for section in result["sections"]:
         for row_data in section["rows"]:
             row = row_data["row"]
-            rule = row.default_projection_rule
-            if not rule:
-                continue
-            rule_type = rule.get("type")
-            if rule_type == "sum_rows":
-                refs = rule.get("row_ids", [])
-            elif rule_type in ("percent_of_row", "previous_period"):
-                rid = rule.get("row_id")
-                refs = [rid] if rid is not None else []
-            else:
-                refs = []
-            missing = [r for r in refs if r not in all_row_ids]
+            refs = rule_row_refs(row.default_projection_rule)
+            # isinstance first: a malformed stored ref may be unhashable.
+            missing = [r for r in refs if not isinstance(r, int) or r not in all_row_ids]
             if missing:
                 issues.append(
                     f"La fila '{row.name}' referencia row_id(s) inexistente(s) {missing} — "
@@ -1073,27 +1068,18 @@ def cmd_sections(db, args) -> None:
 
 
 
-def _do_add_section(
-    db, sheet: CashflowSheet, name: str, section_type: str = "custom", sort_order: Optional[int] = None,
-) -> SheetSection:
-    """Add a section to `sheet`. Commits. Default sort_order is one past the
-    current max in the sheet (append at the end) -- NOT 0, which would
-    silently reorder every existing section visually."""
-    if sort_order is None:
-        existing = db.query(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
-        sort_order = 0 if not existing else max(s.sort_order for s in existing) + 1
-    section = SheetSection(sheet_id=sheet.id, name=name, section_type=section_type, sort_order=sort_order)
-    db.add(section)
-    db.commit()
-    db.refresh(section)
-    return section
-
-
+# The section/row write primitives (_do_add_section, _do_add_row,
+# _do_edit_row) now live in opencashflow.structure -- imported above under
+# their old names.
 
 
 def cmd_section_add(db, args) -> None:
     sheet = _pick_sheet(db, args.sheet_id)
-    section = _do_add_section(db, sheet, args.name, args.type, args.sort_order)
+    try:
+        section = _do_add_section(db, sheet, args.name, args.type, args.sort_order)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
     print(f"[OK] Sección creada: [{section.id}] {section.name}  tipo={section.section_type}  orden={section.sort_order}")
     print(
         f"Siguiente paso: opencashflow row add --sheet-id {sheet.id} --section {section.id} --name \"...\""
@@ -1134,33 +1120,15 @@ def cmd_rows(db, args) -> None:
 
 
 
-def _do_add_row(
-    db, section: SheetSection, name: str, row_type: str = "input", sign: str = "positive",
-    rule: Optional[dict] = None, sort_order: Optional[int] = None,
-) -> SheetRow:
-    """Add a row to `section`. Commits. Default sort_order is one past the
-    current max WITHIN that section (append at the end), same reasoning as
-    _do_add_section."""
-    if sort_order is None:
-        existing = db.query(SheetRow).filter(SheetRow.section_id == section.id).all()
-        sort_order = 0 if not existing else max(r.sort_order for r in existing) + 1
-    row = SheetRow(
-        section_id=section.id, name=name, row_type=row_type, sign=sign,
-        default_projection_rule=rule, sort_order=sort_order,
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
-
-
-
-
 def cmd_row_add(db, args) -> None:
     sheet = _pick_sheet(db, args.sheet_id)
     section = _resolve_section(db, sheet.id, args.section)
     rule = _build_rule_from_args(db, sheet.id, args)
-    row = _do_add_row(db, section, args.name, args.row_type, args.sign, rule, args.sort_order)
+    try:
+        row = _do_add_row(db, section, args.name, args.row_type, args.sign, rule, args.sort_order)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
     all_rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
     row_id_to_name = {r.id: r.name for r in all_rows}
@@ -1174,48 +1142,11 @@ def cmd_row_add(db, args) -> None:
 
 
 # Sentinel distinguishing "this field wasn't passed at all, don't touch it"
-# from a real value (crucially, from an explicit `rule=None`, which means
-# "clear the rule" -- see _do_edit_row and cmd_row_edit's --clear-rule).
+# from a real value -- for _do_edit_wallet/_do_edit_card below and the
+# wizard's own "no cambiar" answers. (_do_edit_row has its own,
+# opencashflow.structure.UNSET; nothing passes this one to it -- callers
+# only pass the fields that change.)
 _UNSET = object()
-
-
-
-
-def _do_edit_row(
-    db, row: SheetRow, *, name=_UNSET, row_type=_UNSET, sign=_UNSET, rule=_UNSET, sort_order=_UNSET,
-) -> Dict[str, Tuple]:
-    """Partial update of `row`: only fields actually passed (i.e. not left
-    at the _UNSET default) are considered, and only ones that actually
-    change something are applied -- mirrors the HTTP RowUpdate/update_row
-    `model_dump(exclude_unset=True)` pattern, but operating directly on the
-    ORM row rather than through that Pydantic schema. `rule=None` explicitly
-    clears default_projection_rule (distinct from not passing `rule` at
-    all). Commits only if something actually changed. Returns
-    {field_name: (old_value, new_value)} for every field that changed --
-    field_name is one of "name"/"row_type"/"sign"/"rule"/"sort_order" (the
-    "rule" one is for default_projection_rule) -- so the caller can print an
-    exact "antes -> después" summary without re-deriving what changed itself.
-    """
-    changes: Dict[str, Tuple] = {}
-    if name is not _UNSET and name != row.name:
-        changes["name"] = (row.name, name)
-        row.name = name
-    if row_type is not _UNSET and row_type != row.row_type:
-        changes["row_type"] = (row.row_type, row_type)
-        row.row_type = row_type
-    if sign is not _UNSET and sign != row.sign:
-        changes["sign"] = (row.sign, sign)
-        row.sign = sign
-    if rule is not _UNSET and rule != row.default_projection_rule:
-        changes["rule"] = (row.default_projection_rule, rule)
-        row.default_projection_rule = rule
-    if sort_order is not _UNSET and sort_order != row.sort_order:
-        changes["sort_order"] = (row.sort_order, sort_order)
-        row.sort_order = sort_order
-    if changes:
-        db.commit()
-        db.refresh(row)
-    return changes
 
 
 
@@ -1242,7 +1173,11 @@ def cmd_row_edit(db, args) -> None:
     elif args.rule_type:
         kwargs["rule"] = _build_rule_from_args(db, sheet.id, args)
 
-    changes = _do_edit_row(db, row, **kwargs)
+    try:
+        changes = _do_edit_row(db, row, **kwargs)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
     if not changes:
         print(f"Fila [{row.id}] '{row.name}': no se pasó ningún cambio.")
@@ -2844,13 +2779,17 @@ def _wizard_maybe_set_end_date(db, sheet: CashflowSheet, row: SheetRow, owner_us
 
 def _wizard_add_row_named(
     db, sheet: CashflowSheet, section: SheetSection, name: str, created_rows: List[SheetRow], owner_user_id: int,
-) -> SheetRow:
+) -> Optional[SheetRow]:
     row_type = _wizard_prompt_choice("    Tipo de fila", _ROW_TYPE_CHOICES, "input")
     print("    Nota: el signo solo importa si esta fila es referenciada dentro del sum_rows de otra fila.")
     sign = _wizard_prompt_choice("    Signo", ["positive", "negative"], "positive")
     rule = _wizard_prompt_rule_for_new_row(db, sheet.id, created_rows)
 
-    row = _do_add_row(db, section, name, row_type, sign, rule)
+    try:
+        row = _do_add_row(db, section, name, row_type, sign, rule)
+    except ValueError as e:
+        print(f"    {e}")
+        return None
     created_rows.append(row)
 
     all_rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
@@ -2885,7 +2824,11 @@ def _wizard_edit_add_section(db, sheet: CashflowSheet) -> None:
         print("  Cancelado (nombre vacío).")
         return
     section_type = _wizard_prompt_choice("  Tipo de sección", _SECTION_TYPE_CHOICES, "custom")
-    section = _do_add_section(db, sheet, name, section_type)
+    try:
+        section = _do_add_section(db, sheet, name, section_type)
+    except ValueError as e:
+        print(f"  {e}")
+        return
     print(f"  [OK] Sección creada: [{section.id}] {section.name}  tipo={section.section_type}  orden={section.sort_order}")
 
 
@@ -2911,7 +2854,11 @@ def _wizard_edit_add_row(db, sheet: CashflowSheet) -> None:
     sign = _wizard_prompt_choice("  Signo", ["positive", "negative"], "positive")
     rule = _wizard_prompt_rule_for_new_row(db, sheet.id, all_rows)
 
-    row = _do_add_row(db, section, name, row_type, sign, rule)
+    try:
+        row = _do_add_row(db, section, name, row_type, sign, rule)
+    except ValueError as e:
+        print(f"  {e}")
+        return
     row_id_to_name = {r.id: r.name for r in all_rows}
     row_id_to_name[row.id] = row.name
     print(
@@ -2958,7 +2905,11 @@ def _wizard_edit_row(db, sheet: CashflowSheet) -> None:
     if rule_choice is not _UNSET:
         kwargs["rule"] = rule_choice
 
-    changes = _do_edit_row(db, row, **kwargs)
+    try:
+        changes = _do_edit_row(db, row, **kwargs)
+    except ValueError as e:
+        print(f"  {e}")
+        return
     if not changes:
         print(f"  Fila [{row.id}] '{row.name}': no se pasó ningún cambio.")
         return

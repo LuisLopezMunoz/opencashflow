@@ -55,7 +55,9 @@ class SheetOut(BaseModel):
 class SectionCreate(BaseModel):
     name: str
     section_type: str = "custom"
-    sort_order: int = 0
+    # None = append after the sheet's last section (structure.add_section);
+    # a fixed 0 default would silently reorder every existing section.
+    sort_order: Optional[int] = None
     is_collapsible: bool = True
     color_hex: Optional[str] = None
 
@@ -79,7 +81,8 @@ class SectionOut(BaseModel):
 class RowCreate(BaseModel):
     name: str
     row_type: str = "input"
-    sort_order: int = 0
+    # None = append after the section's last row (structure.add_row).
+    sort_order: Optional[int] = None
     is_visible: bool = True
     default_projection_rule: Optional[Dict[str, Any]] = None
     ledger_mapping: Optional[Dict[str, Any]] = None
@@ -87,7 +90,14 @@ class RowCreate(BaseModel):
     notes: Optional[str] = None
 
 
+_ROW_COLUMNS_NOT_NULL = ("name", "row_type", "sort_order", "is_visible", "sign")
+
+
 class RowUpdate(BaseModel):
+    """Partial update: only fields present in the request are applied (see
+    `model_fields_set`). An explicit null clears default_projection_rule/
+    ledger_mapping/notes; it's rejected for the columns that can't be null."""
+
     name: Optional[str] = None
     row_type: Optional[str] = None
     sort_order: Optional[int] = None
@@ -96,6 +106,13 @@ class RowUpdate(BaseModel):
     ledger_mapping: Optional[Dict[str, Any]] = None
     sign: Optional[str] = None
     notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _no_null_for_required_columns(self) -> "RowUpdate":
+        nulled = [f for f in _ROW_COLUMNS_NOT_NULL if f in self.model_fields_set and getattr(self, f) is None]
+        if nulled:
+            raise ValueError(f"These fields can't be null: {', '.join(nulled)}.")
+        return self
 
 
 class RowOut(BaseModel):
@@ -196,6 +213,41 @@ class CellActualUpdate(BaseModel):
     accrued_value: Optional[Decimal] = None
     paid_value: Optional[Decimal] = None
     note: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Action request bodies -- an operation on existing objects, not a resource
+# being created/updated, hence *Request rather than *Create/*Update.
+# ---------------------------------------------------------------------------
+
+class RecordUndoRequest(BaseModel):
+    """Request body for POST .../cells/{row_id}/{period_id}/actual/undo."""
+
+    note: Optional[str] = None
+
+
+class RecordClearRequest(BaseModel):
+    """Request body for POST .../rows/{row_id}/actual/clear -- every period
+    is cleared in one transaction (record_ops.clear_record)."""
+
+    period_ids: List[int] = Field(min_length=1)
+    note: Optional[str] = None
+
+
+class PeriodCloseRequest(BaseModel):
+    """Request body for POST .../periods/{period_id}/close -- the
+    period_close.close_period keyword arguments."""
+
+    balance_row_id: Optional[int] = None  # None = find the sheet's running_balance row
+    assume_unrecorded_as_pending: bool = False
+    dry_run: bool = False
+
+
+class PeriodReopenRequest(BaseModel):
+    """Request body for POST .../periods/{period_id}/reopen."""
+
+    balance_row_id: Optional[int] = None
+    dry_run: bool = False
 
 
 # ---------------------------------------------------------------------------

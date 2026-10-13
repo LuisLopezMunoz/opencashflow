@@ -9,9 +9,34 @@ en su propio `PENDIENTES.md`, no acá.
 
 ## Abiertos
 
-_(ninguno por ahora)_
+- **Menor -- el mensaje del guard de período cerrado mezcla idiomas** ("Cannot registrar un
+  record on…") y sugiere `period_close.reopen_period` en vez de `ocf period reopen --period
+  YYYY-MM`. Llega tal cual al `detail` de un 400 de la API HTTP del client.
 
 ## Resueltos (referencia)
+
+- **`structure.py` + validación de reglas, para la Fase 2.1 de la API HTTP** (2026-10-13,
+  pendiente de release como v0.15.0).
+  - **Nuevo `opencashflow.structure`**: `add_section`/`add_row`/`edit_row` salen de `cli.py`
+    (que los conserva como alias `_do_add_section`/`_do_add_row`/`_do_edit_row`), y ahora
+    cubren todos los campos de los DTOs (`is_collapsible`/`color_hex`, `is_visible`/
+    `ledger_mapping`/`notes`). `edit_row` valida todo ANTES de tocar la fila (antes, un
+    `sign` inválido dejaba el `name` ya cambiado en la sesión).
+  - **`validate_rule`** -- se llama en `add_row`, `edit_row` y `overrides.set_override`
+    (regla manual). Rechaza una regla que referencia filas de otra planilla o inexistentes
+    (el motor las lee como nada: una suma subestimada en silencio, que `doctor` solo
+    reporta después), ids que no son enteros, y un `base_rule` de `carry_forward` que no es
+    un objeto -- ese caso **tumbaba `compute_sheet` entero con `AttributeError`** (fuera del
+    try/except por celda del motor). El CLI nunca podía producir estas reglas (resuelve las
+    filas dentro de la planilla); una API que recibe la regla como dato sí. Un tipo de
+    regla desconocido se sigue aceptando a propósito: el motor lo reporta por celda.
+    Rojo verificado contra v0.14.0 en un worktree descartable.
+  - **`doctor`** usa el mismo `rule_row_refs`, así que ahora también ve una referencia
+    rota dentro del `base_rule` de un `carry_forward`, y no se cae con un ref malformado.
+  - **`schemas.py`**: `SectionCreate`/`RowCreate.sort_order` pasan de `0` a `None`
+    (agregar al final, como el CLI -- un 0 fijo reordenaba la planilla); `RowUpdate`
+    rechaza `null` en columnas obligatorias; cuerpos de acción nuevos
+    (`RecordUndoRequest`, `RecordClearRequest`, `PeriodCloseRequest`, `PeriodReopenRequest`).
 
 - **Fase 0 del plan de la API HTTP: `record_ops.py` + DTOs en `schemas.py`** (2026-10-12).
   - **Nuevo `opencashflow.record_ops`** (mismo patrón que `overrides.py`): `set_record`/
