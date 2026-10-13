@@ -16,7 +16,7 @@ en su propio `PENDIENTES.md`, no acá.
 ## Resueltos (referencia)
 
 - **`structure.py` + validación de reglas, para la Fase 2.1 de la API HTTP** (2026-10-13,
-  pendiente de release como v0.15.0).
+  publicado como v0.15.0).
   - **Nuevo `opencashflow.structure`**: `add_section`/`add_row`/`edit_row` salen de `cli.py`
     (que los conserva como alias `_do_add_section`/`_do_add_row`/`_do_edit_row`), y ahora
     cubren todos los campos de los DTOs (`is_collapsible`/`color_hex`, `is_visible`/
