@@ -61,9 +61,7 @@ from opencashflow.engine import (
 from opencashflow.models import (
     Base,
     CashflowSheet,
-    CellActualEntry,
     CellOverride,
-    SheetCell,
     SheetPeriod,
     SheetRow,
     SheetSection,
@@ -75,11 +73,12 @@ from opencashflow.period_close import AGGREGATE_ROW_TYPES as _AGGREGATE_ROW_TYPE
 from opencashflow.period_close import CloseReport, ReopenReport, close_period, reopen_period
 from opencashflow.period_close import find_balance_row as _find_balance_row_or_raise
 from opencashflow.periods import extend_periods_backward, find_anchor_period, generate_periods
-from opencashflow.record_stack import (
-    guard_periods_not_closed as _guard_periods_not_closed,
-    pop_record_stack as _pop_record_stack,
-    replay_record_stack as _replay_record_stack,
-)
+from opencashflow.record_ops import UNSET as _RECORD_UNSET
+from opencashflow.record_ops import RecordClearResult, RecordHistoryEntry, RecordSetResult, RecordUndoResult
+from opencashflow.record_ops import clear_record as _do_record_clear
+from opencashflow.record_ops import record_history as _do_record_history
+from opencashflow.record_ops import set_record as _do_record_set
+from opencashflow.record_ops import undo_record as _do_record_undo
 from opencashflow.seed import seed_sheet
 from opencashflow.sheet_spec import (
     export_sheet_spec,
@@ -1314,30 +1313,24 @@ def cmd_record_set(db, args) -> None:
         print(f"La planilla #{sheet.id} no tiene un período para {period_dt.strftime('%Y-%m')}.", file=sys.stderr)
         sys.exit(1)
 
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row.id, SheetCell.period_id == period.id).first()
-    if not cell:
-        cell = SheetCell(row_id=row.id, period_id=period.id)
-        db.add(cell)
-        db.flush()
-
-    previous_actual = cell.actual_value
-    if args.actual is not None:
-        cell.actual_value = Decimal(str(args.actual))
-    if args.accrued is not None:
-        cell.accrued_value = Decimal(str(args.accrued))
-    if args.paid is not None:
-        cell.paid_value = Decimal(str(args.paid))
+    # argparse can only express "omitted" (None), never "clear this one
+    # field" -- so None always maps to record_ops' own UNSET sentinel here
+    # (NOT this module's unrelated _UNSET, used by the _do_edit_* helpers).
+    def _field(raw):
+        return _RECORD_UNSET if raw is None else Decimal(str(raw))
 
     user_id = args.user_id if args.user_id is not None else sheet.user_id
-    db.add(CellActualEntry(
-        cell_id=cell.id,
-        actual_value=cell.actual_value,
-        accrued_value=cell.accrued_value,
-        paid_value=cell.paid_value,
-        note=args.note,
-        created_by=user_id,
-    ))
-    db.commit()
+    try:
+        record = _do_record_set(
+            db, row, period,
+            actual_value=_field(args.actual), accrued_value=_field(args.accrued), paid_value=_field(args.paid),
+            note=args.note, created_by=user_id,
+        )
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    previous_actual = record.previous[0]
+    current_actual = record.current[0]
 
     result = compute_sheet(sheet.id, db)
     cell_result = None
@@ -1349,7 +1342,7 @@ def cmd_record_set(db, args) -> None:
                         cell_result = cr
 
     projected_text = _fmt_number(cell_result.projected_value if cell_result else None, args.unit)
-    actual_text = _fmt_number(cell.actual_value, args.unit)
+    actual_text = _fmt_number(current_actual, args.unit)
     variance_text = _fmt_number(cell_result.variance if cell_result else None, args.unit)
     before_text = _fmt_number(previous_actual, args.unit) if previous_actual is not None else "—"
 
@@ -1359,114 +1352,15 @@ def cmd_record_set(db, args) -> None:
 
 # ---------------------------------------------------------------------------
 # record history / undo / clear -- the "real" layer's own history +
-# undo/clear, symmetric to override's set/clear. `record set` (above) and
-# every other writer of CellActualEntry (bridge_financing.draw_for_deficit,
+# undo/clear, symmetric to override's set/clear. The write/clear/undo/history
+# primitives themselves now live in opencashflow.record_ops (imported above
+# as _do_record_*); `record set` (above) and every other writer of
+# CellActualEntry (bridge_financing.draw_for_deficit,
 # creditcard_statements.sync_period's real-statement branch,
 # opencashflow.wallet_movements' own writes) all append to the SAME
-# append-only log -- none of them are special-cased here, an undo walks
-# back through whichever kind of entry it finds. The stack-replay mechanics
-# themselves (replay_record_stack, guard_periods_not_closed,
-# pop_record_stack) now live in opencashflow.record_stack (imported above) --
-# a public, generic primitive, no longer app-specific plumbing.
+# append-only log -- an undo walks back through whichever kind of entry it
+# finds.
 # ---------------------------------------------------------------------------
-
-
-
-@dataclasses.dataclass
-class RecordHistoryEntry:
-    entry: CellActualEntry
-    is_current: bool
-
-
-
-
-def _do_record_history(db, row: SheetRow, period: SheetPeriod) -> List[RecordHistoryEntry]:
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row.id, SheetCell.period_id == period.id).first()
-    if cell is None:
-        return []
-    live = (cell.actual_value, cell.accrued_value, cell.paid_value)
-    views = []
-    current_index = None
-    for i, entry in enumerate(cell.actual_entries):
-        if (entry.actual_value, entry.accrued_value, entry.paid_value) == live:
-            current_index = i  # el último que calce gana -- el historial puede repetir valores
-        views.append(RecordHistoryEntry(entry=entry, is_current=False))
-    if current_index is not None:
-        views[current_index].is_current = True
-    return views
-
-
-@dataclasses.dataclass
-
-
-class RecordUndoResult:
-    period: SheetPeriod
-    reverted_from: CellActualEntry
-    reverted_to: Optional[CellActualEntry]  # None significa "vuelve a sin valor registrado"
-    new_entry: CellActualEntry
-
-
-
-
-def _do_record_undo(db, sheet_id: int, row: SheetRow, period: SheetPeriod, *, note: Optional[str], created_by: int) -> RecordUndoResult:
-    _guard_periods_not_closed([period], "deshacer un record")
-
-    cell = db.query(SheetCell).filter(SheetCell.row_id == row.id, SheetCell.period_id == period.id).first()
-    if cell is None or not cell.actual_entries:
-        raise ValueError(
-            f"'{row.name}' en {_period_label(period)} no tiene ningún record registrado -- no hay nada que deshacer."
-        )
-
-    try:
-        reverted_from, reverted_to, new_entry = _pop_record_stack(db, cell, note=note, created_by=created_by)
-    except ValueError:
-        raise ValueError(
-            f"'{row.name}' en {_period_label(period)}: ya se deshicieron todos los cambios registrados -- "
-            f"no queda nada más que deshacer."
-        )
-
-    db.commit()
-    db.refresh(new_entry)
-
-    return RecordUndoResult(period=period, reverted_from=reverted_from, reverted_to=reverted_to, new_entry=new_entry)
-
-
-@dataclasses.dataclass
-
-
-class RecordClearResult:
-    period: SheetPeriod
-    cleared: bool
-    previous: Optional[Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]] = None
-
-
-
-
-def _do_record_clear(
-    db, sheet_id: int, row: SheetRow, periods: List[SheetPeriod], *, note: Optional[str], created_by: int,
-) -> List[RecordClearResult]:
-    _guard_periods_not_closed(periods, "limpiar un record")
-
-    results: List[RecordClearResult] = []
-    for period in periods:
-        cell = db.query(SheetCell).filter(SheetCell.row_id == row.id, SheetCell.period_id == period.id).first()
-        if cell is None or (cell.actual_value is None and cell.accrued_value is None and cell.paid_value is None):
-            results.append(RecordClearResult(period=period, cleared=False))
-            continue
-
-        previous = (cell.actual_value, cell.accrued_value, cell.paid_value)
-        cell.actual_value = None
-        cell.accrued_value = None
-        cell.paid_value = None
-        write_note = note or "[record clear] limpieza manual del valor real -- vuelve a sin valor registrado"
-        db.add(CellActualEntry(
-            cell_id=cell.id, actual_value=None, accrued_value=None, paid_value=None,
-            note=write_note, created_by=created_by,
-        ))
-        results.append(RecordClearResult(period=period, cleared=True, previous=previous))
-
-    db.commit()
-    return results
 
 
 
@@ -1483,7 +1377,7 @@ def cmd_record_undo(db, args) -> None:
 
     user_id = args.user_id if args.user_id is not None else sheet.user_id
     try:
-        result = _do_record_undo(db, sheet.id, row, period, note=args.note, created_by=user_id)
+        result = _do_record_undo(db, row, period, note=args.note, created_by=user_id)
     except ValueError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
@@ -1515,7 +1409,7 @@ def cmd_record_clear(db, args) -> None:
     user_id = args.user_id if args.user_id is not None else sheet.user_id
 
     try:
-        results = _do_record_clear(db, sheet.id, row, periods, note=args.note, created_by=user_id)
+        results = _do_record_clear(db, row, periods, note=args.note, created_by=user_id)
     except ValueError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
@@ -1557,9 +1451,13 @@ def cmd_override_set(db, args) -> None:
     value = Decimal(str(args.value)) if has_value else None
     user_id = args.user_id if args.user_id is not None else sheet.user_id
 
-    results = _do_set_override(
-        db, sheet.id, row, periods, value=value, rule=rule, lock=has_lock, note=args.note, created_by=user_id,
-    )
+    try:
+        results = _do_set_override(
+            db, sheet.id, row, periods, value=value, rule=rule, lock=has_lock, note=args.note, created_by=user_id,
+        )
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
     all_rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
     row_id_to_name = {r.id: r.name for r in all_rows}
@@ -1573,7 +1471,11 @@ def cmd_override_clear(db, args) -> None:
     row = _resolve_row(db, sheet.id, args.row)
     periods = _resolve_target_periods(db, sheet.id, args.period, args.from_period, args.to_period)
 
-    results = _do_clear_override(db, sheet.id, row, periods)
+    try:
+        results = _do_clear_override(db, sheet.id, row, periods)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
     all_rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
     row_id_to_name = {r.id: r.name for r in all_rows}
@@ -2925,9 +2827,13 @@ def _wizard_maybe_set_end_date(db, sheet: CashflowSheet, row: SheetRow, owner_us
         f"desde {from_period_str} hasta {to_period_str}. Esto es solo un override -- no un estado "
         f"especial de la fila -- y es reversible con 'override clear'."
     )
-    results = _do_set_override(
-        db, sheet.id, row, periods, value=Decimal("0"), rule=None, lock=False, note=note, created_by=owner_user_id,
-    )
+    try:
+        results = _do_set_override(
+            db, sheet.id, row, periods, value=Decimal("0"), rule=None, lock=False, note=note, created_by=owner_user_id,
+        )
+    except ValueError as e:
+        print(f"  {e}")
+        return
     print(f"  [OK] {note}")
     all_rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
     row_id_to_name = {r.id: r.name for r in all_rows}
@@ -3114,9 +3020,13 @@ def _wizard_edit_set_override(db, sheet: CashflowSheet) -> None:
 
     note = input("  Nota (opcional): ").strip() or None
 
-    results = _do_set_override(
-        db, sheet.id, row, periods, value=value, rule=rule, lock=lock, note=note, created_by=sheet.user_id,
-    )
+    try:
+        results = _do_set_override(
+            db, sheet.id, row, periods, value=value, rule=rule, lock=lock, note=note, created_by=sheet.user_id,
+        )
+    except ValueError as e:
+        print(f"  {e}")
+        return
     all_rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
     row_id_to_name = {r.id: r.name for r in all_rows}
     _print_override_write_results(row, results, row_id_to_name, indent="  ")
@@ -3141,7 +3051,11 @@ def _wizard_edit_clear_override(db, sheet: CashflowSheet) -> None:
     except SystemExit:
         return
 
-    results = _do_clear_override(db, sheet.id, row, periods)
+    try:
+        results = _do_clear_override(db, sheet.id, row, periods)
+    except ValueError as e:
+        print(f"  {e}")
+        return
     all_rows = db.query(SheetRow).join(SheetSection).filter(SheetSection.sheet_id == sheet.id).all()
     row_id_to_name = {r.id: r.name for r in all_rows}
     _print_override_clear_results(row, results, row_id_to_name, indent="  ")

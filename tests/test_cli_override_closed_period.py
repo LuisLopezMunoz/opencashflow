@@ -6,13 +6,14 @@ a real gap: a plain `override set --period <closed>` used to silently
 overwrite the exact value close_period had just frozen.
 """
 from decimal import Decimal
+from types import SimpleNamespace as NS
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from datetime import date
 
-from opencashflow.cli import _do_clear_override, _do_set_override
+from opencashflow.cli import _do_clear_override, _do_set_override, cmd_override_clear, cmd_override_set
 from opencashflow.models import Base, CellOverride, SheetRow
 from opencashflow.seed import seed_sheet
 
@@ -65,3 +66,34 @@ def test_do_clear_override_raises_on_closed_period_and_writes_nothing(db):
         _do_clear_override(db, sheet.id, row, [period])
 
     assert _count_overrides(db) == overrides_before
+
+
+# The CLI commands wrapping the two functions above: the guard's ValueError
+# must surface as a clean stderr message + exit(1), not an uncaught
+# traceback -- which is what it used to be, since neither command caught it.
+
+def _override_args(sheet, row, **overrides):
+    base = dict(sheet_id=sheet.id, row=str(row.id), period="2026-01", from_period=None, to_period=None,
+                value=None, rule_type=None, lock=False, note=None, user_id=None)
+    base.update(overrides)
+    return NS(**base)
+
+
+def test_cmd_override_set_on_closed_period_exits_cleanly(db, capsys):
+    sheet, row, period = _seeded_sheet(db)
+    period.is_closed = True
+    db.commit()
+
+    with pytest.raises(SystemExit):
+        cmd_override_set(db, _override_args(sheet, row, value=999999.0))
+    assert "closed period" in capsys.readouterr().err
+
+
+def test_cmd_override_clear_on_closed_period_exits_cleanly(db, capsys):
+    sheet, row, period = _seeded_sheet(db)
+    period.is_closed = True
+    db.commit()
+
+    with pytest.raises(SystemExit):
+        cmd_override_clear(db, _override_args(sheet, row))
+    assert "closed period" in capsys.readouterr().err
